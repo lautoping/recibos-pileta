@@ -1,0 +1,17 @@
+# Datos de la pileta: NUNCA van al repo (tienen nombres y pagos de personas reales).
+# Se generan con datos inventados con: python generar_datos_ejemplo.py
+recibos.xlsx
+precios.xlsx
+cache_alumnos.json
+config_recibos.json
+alumnos_ejemplo.xlsx
+*.xlsx
+*.xls
+*.bak
+~$*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
