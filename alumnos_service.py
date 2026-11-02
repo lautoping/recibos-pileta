@@ -3,10 +3,12 @@ import io
 import re
 import json
 import base64
+import difflib
 import urllib.request
 import urllib.parse
 from datetime import datetime
 import pandas as pd
+from openpyxl import load_workbook
 
 from config import ARCHIVO_CACHE_ALUMNOS
 from utils import quitar_tildes, formatear_nombre_propio
@@ -127,6 +129,30 @@ def cargar_datos_alumnos_local(ruta_alumnos):
     return extraer_datos_alumnos_dataframe(df)
 
 
+def _grupos_desde_fuente(fuente, nombres):
+    """Lee los grupos familiares (2da hoja) desde una ruta o bytes. Si falla, devuelve [] sin cortar la carga."""
+    try:
+        wb = load_workbook(io.BytesIO(fuente) if isinstance(fuente, (bytes, bytearray)) else fuente)
+        return extraer_grupos_familiares(wb, nombres)
+    except Exception as e:
+        print(f"Aviso: no se pudieron leer los grupos familiares: {e}")
+        return []
+
+
+def cargar_alumnos_completo_local(ruta_alumnos):
+    """(nombres, detalles, grupos familiares) desde un archivo local, sin modificarlo."""
+    if not ruta_alumnos or not os.path.exists(ruta_alumnos):
+        return [], {}, []
+    nombres, detalles = cargar_datos_alumnos_local(ruta_alumnos)
+    return nombres, detalles, _grupos_desde_fuente(ruta_alumnos, nombres)
+
+
+def _procesar_bytes_excel(data):
+    df = pd.read_excel(io.BytesIO(data), sheet_name=0, header=None)
+    nombres, detalles = extraer_datos_alumnos_dataframe(df)
+    return nombres, detalles, _grupos_desde_fuente(data, nombres)
+
+
 def cargar_nombres_desde_archivo_local(ruta_alumnos):
     """Lee la 2da columna de la 1ra hoja desde un archivo local sin modificarlo."""
     nombres, _ = cargar_datos_alumnos_local(ruta_alumnos)
@@ -174,6 +200,12 @@ def _generar_urls_descarga_onedrive(url_original):
 
 def descargar_datos_alumnos_url(url_compartida):
     """Descarga en memoria el Excel desde OneDrive/SharePoint/Drive y extrae nombres y detalles."""
+    nombres, detalles, _ = descargar_alumnos_completo_url(url_compartida)
+    return nombres, detalles
+
+
+def descargar_alumnos_completo_url(url_compartida):
+    """Como descargar_datos_alumnos_url, pero también devuelve los grupos familiares de la 2da hoja."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "*/*",
@@ -187,8 +219,7 @@ def descargar_datos_alumnos_url(url_compartida):
             url_final = resp.geturl()
             body_inicial = resp.read()
             if _es_binario_excel(body_inicial):
-                df = pd.read_excel(io.BytesIO(body_inicial), sheet_name=0, header=None)
-                return extraer_datos_alumnos_dataframe(df)
+                return _procesar_bytes_excel(body_inicial)
 
             if url_final and url_final != url_compartida.strip():
                 for extra_u in _generar_urls_descarga_onedrive(url_final):
@@ -221,10 +252,9 @@ def descargar_datos_alumnos_url(url_compartida):
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = resp.read()
                 if _es_binario_excel(data):
-                    df = pd.read_excel(io.BytesIO(data), sheet_name=0, header=None)
-                    nombres, detalles = extraer_datos_alumnos_dataframe(df)
+                    nombres, detalles, grupos = _procesar_bytes_excel(data)
                     if nombres:
-                        return nombres, detalles
+                        return nombres, detalles, grupos
         except Exception as e:
             errores.append(f"{cand[:40]}... -> {e}")
 
@@ -248,13 +278,15 @@ def cargar_cache_alumnos():
                 data = json.load(f)
                 if "detalles" not in data:
                     data["detalles"] = {}
+                if "grupos_familiares" not in data:
+                    data["grupos_familiares"] = []
                 return data
         except Exception:
             pass
-    return {"fecha_sync": "", "hora_sync": "", "nombres": [], "detalles": {}}
+    return {"fecha_sync": "", "hora_sync": "", "nombres": [], "detalles": {}, "grupos_familiares": []}
 
 
-def guardar_cache_alumnos(nombres, detalles=None):
+def guardar_cache_alumnos(nombres, detalles=None, grupos_familiares=None):
     """Guarda la lista de nombres y detalles en cache_alumnos.json con la marca temporal actual."""
     ahora = datetime.now()
     datos = {
@@ -262,6 +294,7 @@ def guardar_cache_alumnos(nombres, detalles=None):
         "hora_sync": ahora.strftime("%d/%m/%Y %H:%M"),
         "nombres": sorted(list(set(nombres)), key=lambda x: quitar_tildes(x)),
         "detalles": detalles or {},
+        "grupos_familiares": grupos_familiares or [],
     }
     try:
         with open(ARCHIVO_CACHE_ALUMNOS, "w", encoding="utf-8") as f:
@@ -269,3 +302,155 @@ def guardar_cache_alumnos(nombres, detalles=None):
     except Exception:
         pass
     return datos
+
+
+# ==========================================================
+# GRUPOS FAMILIARES (2da hoja de la planilla de alumnos)
+# ==========================================================
+# En la hoja de grupos cada grupo familiar está encerrado con bordes (arriba del primer
+# integrante y abajo del último), con los nombres en la 2da columna (B). Hay secciones por
+# profesor ("MICA", "AGUS", "ALE") con su propio encabezado. El número de la columna A no
+# siempre está en la primera fila del grupo, por eso los grupos se arman con los bordes.
+
+_ENCABEZADOS_GF = ("nombre", "nombres", "apellido y nombre", "nombre y apellido", "integrantes")
+
+
+def _hoja_grupos(wb):
+    for ws in wb.worksheets:
+        t = quitar_tildes(ws.title)
+        if "grupo" in t or "fliar" in t or "familiar" in t or t.startswith("gf"):
+            return ws
+    return wb.worksheets[1] if len(wb.worksheets) > 1 else None
+
+
+def _separar_nombres(texto):
+    """'alma, ivan y Franco Fernandez' -> ['Alma Fernandez', 'Ivan Fernandez', 'Franco Fernandez']."""
+    limpio = " ".join(str(texto).replace("\n", " ").split())
+    partes = [p.strip() for p in re.split(r",|\s+y\s+|\s+e\s+", limpio) if p.strip()]
+    if len(partes) <= 1:
+        return [formatear_nombre_propio(limpio)] if limpio else []
+    ultimo = partes[-1].split()
+    apellido = " ".join(ultimo[1:]) if len(ultimo) > 1 else ""
+    nombres = []
+    for p in partes:
+        if apellido and len(p.split()) == 1:
+            p = f"{p} {apellido}"
+        nombres.append(formatear_nombre_propio(p))
+    return nombres
+
+
+def _tokens(nombre):
+    return [t for t in re.split(r"[^a-z0-9ñ]+", quitar_tildes(nombre)) if len(t) > 1]
+
+
+def buscar_alumno_en_lista(nombre, nombres_alumnos):
+    """
+    Busca a qué alumno de la lista principal corresponde un nombre escrito a mano en la hoja de GF.
+    Coincide si todas las palabras de uno están en el otro (ej. 'Ana Miriam Moyano' ~ 'Ana Moyano').
+    Si hay más de un candidato, devuelve None para no adivinar.
+    """
+    tk_n = set(_tokens(nombre))
+    if len(tk_n) < 2:
+        return None
+    exactos = [a for a in nombres_alumnos if quitar_tildes(a) == quitar_tildes(nombre)]
+    if exactos:
+        return exactos[0]
+    candidatos = []
+    for a in nombres_alumnos:
+        tk_a = set(_tokens(a))
+        if len(tk_a) >= 2 and (tk_n <= tk_a or tk_a <= tk_n):
+            candidatos.append(a)
+    if len(candidatos) == 1:
+        return candidatos[0]
+    if candidatos:
+        return None
+
+    # Errores de tipeo ('Osvlado' / 'Osvaldo', 'Schneemam' / 'Schneemann'): solo si hay un parecido claro
+    objetivo = quitar_tildes(nombre)
+    puntajes = sorted(
+        ((difflib.SequenceMatcher(None, objetivo, quitar_tildes(a)).ratio(), a) for a in nombres_alumnos),
+        reverse=True,
+    )
+    if puntajes and puntajes[0][0] >= 0.88 and (len(puntajes) == 1 or puntajes[0][0] - puntajes[1][0] >= 0.04):
+        return puntajes[0][1]
+    return None
+
+
+def extraer_grupos_familiares(wb, nombres_alumnos=None):
+    """
+    Lee los grupos familiares de un libro de openpyxl.
+    Devuelve lista de grupos: {"seccion", "numero", "miembros": [nombres], "nota"}.
+    Cada miembro se reemplaza por el nombre exacto de la lista de alumnos cuando se lo encuentra.
+    """
+    ws = _hoja_grupos(wb)
+    if ws is None:
+        return []
+    nombres_alumnos = nombres_alumnos or []
+
+    grupos = []
+    actual = None
+    seccion = ""
+
+    def cerrar():
+        nonlocal actual
+        if actual and actual["miembros"]:
+            grupos.append(actual)
+        actual = None
+
+    for r in range(1, ws.max_row + 1):
+        val_a = ws.cell(row=r, column=1).value
+        celda_b = ws.cell(row=r, column=2)
+        val_b = celda_b.value
+        txt_b = " ".join(str(val_b).split()) if val_b is not None else ""
+        txt_a = str(val_a).strip() if val_a is not None else ""
+
+        # Fila de encabezado de sección (ej. "MICA" / "AGUS  | Nombre | Parentesco")
+        if (txt_a and not re.fullmatch(r"\d+(\.0)?", txt_a) and len(txt_a) <= 20 and not txt_b) or quitar_tildes(txt_b) in _ENCABEZADOS_GF:
+            cerrar()
+            if txt_a and not re.fullmatch(r"\d+(\.0)?", txt_a):
+                seccion = txt_a
+            continue
+
+        if not txt_b:
+            # Fila vacía: termina el grupo (salvo que sea una fila intermedia con borde abajo)
+            if actual and celda_b.border.bottom.style:
+                cerrar()
+            elif not any(ws.cell(row=r, column=c).value not in (None, "") for c in range(1, 8)):
+                cerrar()
+            continue
+
+        if celda_b.border.top.style or actual is None:
+            cerrar()
+            actual = {"seccion": seccion, "numero": "", "miembros": [], "nota": ""}
+
+        if txt_a and re.fullmatch(r"\d+(\.0)?", txt_a) and not actual["numero"]:
+            actual["numero"] = txt_a.split(".")[0]
+
+        for nom in _separar_nombres(txt_b):
+            encontrado = buscar_alumno_en_lista(nom, nombres_alumnos)
+            final = encontrado or nom
+            if final not in actual["miembros"]:
+                actual["miembros"].append(final)
+
+        nota = " ".join(
+            " ".join(str(ws.cell(row=r, column=c).value).split())
+            for c in range(4, 8)
+            if ws.cell(row=r, column=c).value is not None and not isinstance(ws.cell(row=r, column=c).value, datetime)
+        )
+        if nota:
+            actual["nota"] = f"{actual['nota']} {nota}".strip()
+
+        if celda_b.border.bottom.style:
+            cerrar()
+
+    cerrar()
+    return grupos
+
+
+def indice_grupos(grupos):
+    """{nombre normalizado: índice del grupo} para buscar rápido el grupo de un alumno."""
+    idx = {}
+    for i, g in enumerate(grupos):
+        for m in g.get("miembros", []):
+            idx.setdefault(quitar_tildes(m), i)
+    return idx

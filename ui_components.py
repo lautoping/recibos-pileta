@@ -450,6 +450,9 @@ class AlumnoItem:
         self.entry_actividad_otro = None
         self.f_gf_asociado = None
         self.entry_gf_asociado = None
+        self.f_gf_info = None
+        self._gf_auto_clave = None   # (nombre, fecha) para la que ya se aplicó el dto. GF automático
+        self._gf_auto_texto = ""     # texto que puso la app en "Familiar / Recibo GF"
 
         self._construir_ui()
         self._vincular_trazas()
@@ -474,6 +477,10 @@ class AlumnoItem:
         # Etiqueta para mostrar los días de clase extraídos
         self.lbl_dias_clase = ttk.Label(f_nom, text="", font=("Segoe UI", 8, "italic"), foreground="#0284c7")
         self.lbl_dias_clase.pack(anchor=tk.W, pady=(2, 0))
+
+        # Grupo familiar (2da hoja de la planilla): otros integrantes, botones para sumarlos y dto. GF
+        self.f_gf_info = ttk.Frame(f_nom)
+        self.f_gf_info.pack(anchor=tk.W, fill=tk.X)
 
         # Vencimiento individual por alumno
         self.f_venc = ttk.Frame(f1)
@@ -641,6 +648,8 @@ class AlumnoItem:
         if not nom:
             if self.lbl_dias_clase:
                 self.lbl_dias_clase.config(text="")
+            if hasattr(self.app, "_refrescar_info_gf"):
+                self.app._refrescar_info_gf()
             self.app._actualizar_calculo_precio()
             return
 
@@ -666,7 +675,111 @@ class AlumnoItem:
             if self.lbl_dias_clase:
                 self.lbl_dias_clase.config(text="")
 
+        if hasattr(self.app, "_refrescar_info_gf"):
+            self.app._refrescar_info_gf()
         self.app._actualizar_calculo_precio()
+
+    def _descuento_por_defecto(self):
+        mp = self.app.var_metodo_pago.get() if hasattr(self.app, "var_metodo_pago") else ""
+        return "Efectivo" if mp == "Efectivo" else "Ninguno"
+
+    def actualizar_info_gf(self):
+        """
+        Muestra el grupo familiar del alumno según la 2da hoja de la planilla:
+        - Titular: los otros integrantes con un botón para sumarlos al recibo. Si paga solo y otro
+          integrante ya tiene un recibo vigente, aplica el dto. GF y completa 'GF Fulano RXX del dd/mm'.
+        - Resto: avisa si no figura en el mismo grupo que el titular.
+        """
+        if not self.f_gf_info or not hasattr(self.app, "grupo_de"):
+            return
+        for w in self.f_gf_info.winfo_children():
+            w.destroy()
+
+        nom = self.var_nombre.get().strip()
+        items = getattr(self.app, "alumnos_items", [])
+        estilo = {"font": ("Segoe UI", 8), "foreground": "#7c3aed"}
+
+        def revertir_auto():
+            if self._gf_auto_clave is not None:
+                if self.var_gf_asociado.get() == self._gf_auto_texto:
+                    self.var_gf_asociado.set("")
+                if self.var_descuento.get() == "Grupo familiar":
+                    self.var_descuento.set(self._descuento_por_defecto())
+            self._gf_auto_clave = None
+            self._gf_auto_texto = ""
+
+        grupo = self.app.grupo_de(nom) if nom else None
+
+        if not self.es_titular:
+            titular = items[0] if items else None
+            tit_nom = titular.var_nombre.get().strip() if titular else ""
+            if nom and tit_nom:
+                g_tit = self.app.grupo_de(tit_nom)
+                mismos = {quitar_tildes(m) for m in g_tit["miembros"]} if g_tit else set()
+                if quitar_tildes(nom) not in mismos:
+                    ttk.Label(
+                        self.f_gf_info,
+                        text=f"⚠️ No figura en el mismo grupo familiar que {tit_nom} en la planilla",
+                        font=("Segoe UI", 8, "bold"),
+                        foreground="#b45309",
+                    ).pack(anchor=tk.W)
+                else:
+                    ttk.Label(self.f_gf_info, text="👪 Mismo grupo familiar que el titular", **estilo).pack(anchor=tk.W)
+            return
+
+        if not grupo:
+            revertir_auto()
+            return
+
+        otros = [m for m in grupo["miembros"] if quitar_tildes(m) != quitar_tildes(nom)]
+        en_recibo = {quitar_tildes(it.var_nombre.get().strip()) for it in items}
+        solo = len(items) <= 1
+        previo = self.app.recibo_gf_previo(nom) if solo else None
+
+        ttk.Label(self.f_gf_info, text=f"👪 Grupo familiar: {', '.join(otros) or '(sin otros integrantes)'}", **estilo).pack(anchor=tk.W)
+
+        f_btns = ttk.Frame(self.f_gf_info)
+        f_btns.pack(anchor=tk.W)
+        for m in otros:
+            if quitar_tildes(m) in en_recibo:
+                continue
+            if previo and quitar_tildes(previo["nombre"]) == quitar_tildes(m):
+                continue  # ya pagó este mes: no se suma al recibo
+            ttk.Button(f_btns, text=f"+ {m}", command=lambda m=m: self.app.agregar_miembro_gf(m)).pack(side=tk.LEFT, padx=(0, 4), pady=(1, 0))
+
+        if not solo:
+            return
+
+        clave = (quitar_tildes(nom), getattr(self.app, "var_fecha_emision", tk.StringVar()).get())
+        if previo:
+            fecha_corta = previo["fecha"][:5] if len(previo["fecha"]) >= 5 else previo["fecha"]
+            texto_gf = f"GF {previo['nombre']} R{previo['nro']} del {fecha_corta}"
+            if self.var_descuento.get() == "Jubilado":
+                ttk.Label(
+                    self.f_gf_info,
+                    text=f"ℹ️ {previo['nombre']} ya pagó (R{previo['nro']} del {previo['fecha']}). Tiene dto. Jubilado; si corresponde GF, marcalo a mano.",
+                    **estilo,
+                ).pack(anchor=tk.W)
+            else:
+                if self._gf_auto_clave != clave:
+                    self._gf_auto_clave = clave
+                    self._gf_auto_texto = texto_gf
+                    self.var_descuento.set("Grupo familiar")
+                    self.var_gf_asociado.set(texto_gf)
+                ttk.Label(
+                    self.f_gf_info,
+                    text=f"✅ Dto. GF: {previo['nombre']} ya pagó el R{previo['nro']} del {previo['fecha']}",
+                    font=("Segoe UI", 8, "bold"),
+                    foreground="#15803d",
+                ).pack(anchor=tk.W)
+        else:
+            if self._gf_auto_clave is not None and self._gf_auto_clave != clave:
+                revertir_auto()
+            ttk.Label(
+                self.f_gf_info,
+                text="Ningún otro integrante tiene un recibo vigente: sin dto. GF si paga solo.",
+                **estilo,
+            ).pack(anchor=tk.W)
 
     def _al_cambiar_descuento(self, *args):
         self._actualizar_visibilidad_gf_asociado()

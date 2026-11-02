@@ -17,6 +17,7 @@ from utils import (
     sumar_un_mes,
     formatear_moneda,
     limpiar_monto,
+    quitar_tildes,
 )
 from excel_manager import (
     cargar_tabla_precios,
@@ -26,12 +27,17 @@ from excel_manager import (
     buscar_recibo,
     recibos_con_mismo_numero_en_el_mes,
     nombre_hoja_mes,
+    resumen_recibos,
+    buscar_recibo_previo_del_grupo,
 )
 from alumnos_service import (
     cargar_cache_alumnos,
     guardar_cache_alumnos,
     descargar_datos_alumnos_url,
     cargar_datos_alumnos_local,
+    cargar_alumnos_completo_local,
+    descargar_alumnos_completo_url,
+    indice_grupos,
     descargar_nombres_desde_url,
     cargar_nombres_desde_archivo_local,
 )
@@ -55,6 +61,9 @@ class ReemplazoCuadernoApp:
         self.precios_data = {}
         self.lista_alumnos = []
         self.detalles_alumnos = {}
+        self.grupos_familiares = []
+        self.indice_gf = {}
+        self.resumen_recibos = []
         self.alumnos_items = []
         self.proximo_recibo_auto = 1
         self.proximo_carnet_auto = 1
@@ -650,6 +659,7 @@ class ReemplazoCuadernoApp:
             self.alumnos_items.remove(item)
             for idx, it in enumerate(self.alumnos_items, start=1):
                 it.actualizar_indice(idx)
+            self._refrescar_info_gf()
             self._actualizar_calculo_precio()
             self.root.update_idletasks()
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -673,6 +683,7 @@ class ReemplazoCuadernoApp:
         cache = cargar_cache_alumnos()
         nombres_cache = cache.get("nombres", [])
         self.detalles_alumnos = cache.get("detalles", {})
+        self._set_grupos(cache.get("grupos_familiares", []))
         fecha_sync = cache.get("fecha_sync", "")
         hora_sync = cache.get("hora_sync", "")
 
@@ -697,10 +708,11 @@ class ReemplazoCuadernoApp:
                 )
         elif ruta_local and os.path.exists(ruta_local):
             try:
-                nombres, detalles = cargar_datos_alumnos_local(ruta_local)
-                datos_c = guardar_cache_alumnos(nombres, detalles)
+                nombres, detalles, grupos = cargar_alumnos_completo_local(ruta_local)
+                datos_c = guardar_cache_alumnos(nombres, detalles, grupos)
                 self.lista_alumnos = nombres
                 self.detalles_alumnos = detalles
+                self._set_grupos(grupos)
                 for it in self.alumnos_items:
                     it.autocomplete.actualizar_base(self.lista_alumnos)
                     it._al_cambiar_nombre()
@@ -733,17 +745,17 @@ class ReemplazoCuadernoApp:
         def tarea():
             try:
                 if url_od:
-                    nombres, detalles = descargar_datos_alumnos_url(url_od)
+                    nombres, detalles, grupos = descargar_alumnos_completo_url(url_od)
                     origen = "OneDrive / Nube"
                 else:
-                    nombres, detalles = cargar_datos_alumnos_local(ruta_local)
+                    nombres, detalles, grupos = cargar_alumnos_completo_local(ruta_local)
                     origen = "Archivo local"
 
-                datos_guardados = guardar_cache_alumnos(nombres, detalles)
+                datos_guardados = guardar_cache_alumnos(nombres, detalles, grupos)
                 self.root.after(
                     0,
                     lambda: self._finalizar_sync_alumnos_exito(
-                        nombres, detalles, datos_guardados["hora_sync"], origen, forzar
+                        nombres, detalles, datos_guardados["hora_sync"], origen, forzar, grupos
                     ),
                 )
             except Exception as e:
@@ -752,14 +764,15 @@ class ReemplazoCuadernoApp:
 
         threading.Thread(target=tarea, daemon=True).start()
 
-    def _finalizar_sync_alumnos_exito(self, nombres, detalles, hora_str, origen_str, mostrar_popup):
+    def _finalizar_sync_alumnos_exito(self, nombres, detalles, hora_str, origen_str, mostrar_popup, grupos=None):
         self.lista_alumnos = nombres
         self.detalles_alumnos = detalles
+        self._set_grupos(grupos or [])
         for it in self.alumnos_items:
             it.autocomplete.actualizar_base(self.lista_alumnos)
             it._al_cambiar_nombre()
         self.lbl_estado_alumnos.config(
-            text=f"✅ {len(nombres)} alumnos importados desde {origen_str} (2da columna, 1ra hoja) - Actualizado: {hora_str}"
+            text=f"✅ {len(nombres)} alumnos y {len(self.grupos_familiares)} grupos familiares importados desde {origen_str} - Actualizado: {hora_str}"
         )
         if mostrar_popup:
             messagebox.showinfo(
@@ -782,6 +795,36 @@ class ReemplazoCuadernoApp:
             )
         if mostrar_popup:
             messagebox.showerror("Error al Sincronizar Link", mensaje_error)
+
+    # ==========================================================
+    # GRUPOS FAMILIARES (2da hoja de la planilla de alumnos)
+    # ==========================================================
+    def _set_grupos(self, grupos):
+        self.grupos_familiares = grupos or []
+        self.indice_gf = indice_grupos(self.grupos_familiares)
+
+    def grupo_de(self, nombre):
+        """El grupo familiar del alumno (dict con 'miembros'), o None."""
+        i = self.indice_gf.get(quitar_tildes(nombre or ""))
+        return self.grupos_familiares[i] if i is not None else None
+
+    def recibo_gf_previo(self, nombre):
+        """Recibo vigente de otro integrante del grupo familiar del alumno (para el dto. GF), o None."""
+        grupo = self.grupo_de(nombre)
+        if not grupo:
+            return None
+        otros = [m for m in grupo["miembros"] if quitar_tildes(m) != quitar_tildes(nombre)]
+        return buscar_recibo_previo_del_grupo(self.resumen_recibos, otros, self.var_fecha_emision.get())
+
+    def agregar_miembro_gf(self, nombre):
+        """Agrega al recibo a otro integrante del grupo familiar con el nombre ya cargado."""
+        self._agregar_alumno()
+        self.alumnos_items[-1].var_nombre.set(nombre)
+        self._refrescar_info_gf()
+
+    def _refrescar_info_gf(self):
+        for it in self.alumnos_items:
+            it.actualizar_info_gf()
 
     def _abrir_dialogo_alumnos(self):
         def al_guardar():
@@ -806,6 +849,7 @@ class ReemplazoCuadernoApp:
             self._inicializar_alumnos()
 
         prox_rec, prox_car, ult_fecha, ultimos = obtener_estado_recibos(self.config["archivo_recibos"])
+        self.resumen_recibos = resumen_recibos(self.config["archivo_recibos"])
         self.proximo_recibo_auto = prox_rec
         self.proximo_carnet_auto = prox_car
 
@@ -827,6 +871,8 @@ class ReemplazoCuadernoApp:
             venc_str = venc.strftime("%d/%m/%Y")
             self.var_fecha_vencimiento.set(venc_str)
             self._propagar_vencimiento_a_alumnos(venc_str)
+            if hasattr(self, "alumnos_items"):
+                self._refrescar_info_gf()
 
     def _forzar_vencimiento_un_mes(self):
         dt = parsear_fecha(self.var_fecha_emision.get())

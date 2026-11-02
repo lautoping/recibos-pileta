@@ -11,7 +11,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from config import COLUMNAS_RECIBOS
-from utils import quitar_tildes, parsear_fecha, formatear_moneda, limpiar_monto
+from utils import quitar_tildes, parsear_fecha, formatear_moneda, limpiar_monto, sumar_un_mes
 
 
 def crear_excel_precios_por_defecto(ruta_precios):
@@ -653,6 +653,59 @@ def eliminar_recibo_por_numero(ruta_recibos, nro_recibo, fecha_emision=None):
     if not fecha_emision:
         raise ValueError("Para eliminar un recibo hace falta su fecha de emisión.")
     return eliminar_recibo(ruta_recibos, nro_recibo, fecha_emision) > 0
+
+
+def resumen_recibos(ruta_recibos):
+    """Lista liviana de todos los recibos (todas las hojas) para buscar recibos anteriores de un grupo familiar."""
+    if not os.path.exists(ruta_recibos):
+        return []
+    try:
+        wb = load_workbook(ruta_recibos, read_only=True, data_only=True)
+    except Exception:
+        return []
+    res = []
+    hojas = sorted((w for w in wb.worksheets if _clave_hoja(w.title)), key=lambda w: _clave_hoja(w.title))
+    for ws in hojas:
+        for fila in ws.iter_rows(min_row=2, max_col=len(COLUMNAS_RECIBOS), values_only=True):
+            if not fila or fila[COL_NOMBRE - 1] in (None, ""):
+                continue
+            res.append({
+                "nro": _nro_normalizado(fila[COL_NRO - 1]),
+                "fecha": _fecha_normalizada(fila[COL_FECHA - 1]),
+                "nombre": str(fila[COL_NOMBRE - 1]).strip(),
+                "actividad": str(fila[COL_ACTIVIDAD - 1] or ""),
+            })
+    wb.close()
+    return res
+
+
+def buscar_recibo_previo_del_grupo(resumen, otros_miembros, fecha_emision):
+    """
+    Busca el recibo más reciente de otro integrante del grupo familiar que esté vigente
+    para la fecha de emisión dada (emitido como mucho un mes antes). None si no hay.
+    """
+    dt_actual = parsear_fecha(fecha_emision) if fecha_emision else None
+    if not dt_actual or not otros_miembros:
+        return None
+    buscados = {quitar_tildes(m) for m in otros_miembros}
+    mejor = None
+    for r in resumen:
+        if r["actividad"] in ACTIVIDADES_NO_RECIBO or r["actividad"].startswith("Carnet"):
+            continue
+        if r["actividad"] in ("Solo Inscripción", "Clase Adaptación (CdA)"):
+            continue
+        if quitar_tildes(r["nombre"]) not in buscados or not r["nro"]:
+            continue
+        dt = parsear_fecha(r["fecha"])
+        if not dt or dt > dt_actual:
+            continue
+        if dt_actual > sumar_un_mes(dt):
+            continue
+        if mejor is None or dt >= mejor["_dt"]:
+            mejor = dict(r, _dt=dt)
+    if mejor:
+        mejor.pop("_dt", None)
+    return mejor
 
 
 def obtener_recibos_con_deuda(ruta_recibos):
