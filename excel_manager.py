@@ -674,9 +674,59 @@ def resumen_recibos(ruta_recibos):
                 "fecha": _fecha_normalizada(fila[COL_FECHA - 1]),
                 "nombre": str(fila[COL_NOMBRE - 1]).strip(),
                 "actividad": str(fila[COL_ACTIVIDAD - 1] or ""),
+                "vto": _fecha_normalizada(fila[6]) if fila[6] not in (None, "") else "",
             })
     wb.close()
     return res
+
+
+ACTIVIDADES_SIN_CUOTA = ("Cobro de Saldo", "Carnet", "Solo Inscripción", "Clase Adaptación (CdA)")
+
+
+def _es_de(r, nombre):
+    return quitar_tildes(" ".join(str(r["nombre"]).split())) == quitar_tildes(" ".join(str(nombre).split()))
+
+
+def buscar_cda_previa(resumen, nombre, fecha_emision):
+    """La Clase de Adaptación (CdA) más reciente del alumno emitida hasta la fecha dada, o None."""
+    dt_actual = parsear_fecha(fecha_emision) if fecha_emision else None
+    mejor = None
+    for r in resumen:
+        if r["actividad"] != "Clase Adaptación (CdA)" or not _es_de(r, nombre):
+            continue
+        dt = parsear_fecha(r["fecha"])
+        if not dt or (dt_actual and dt > dt_actual):
+            continue
+        if mejor is None or dt >= mejor[0]:
+            mejor = (dt, r)
+    return mejor[1] if mejor else None
+
+
+def calcular_vto_desde_recibo_anterior(resumen, nombre, fecha_emision):
+    """
+    Si el alumno tiene un recibo de cuota emitido en el mes anterior al de fecha_emision,
+    devuelve (nuevo_vto 'dd/mm/aaaa', recibo_anterior): el vencimiento anterior + 1 mes.
+    Si no hay recibo en el mes anterior (o no tenía vencimiento), devuelve (None, None).
+    """
+    dt_actual = parsear_fecha(fecha_emision) if fecha_emision else None
+    if not dt_actual:
+        return None, None
+    mes_ant = (dt_actual.year, dt_actual.month - 1) if dt_actual.month > 1 else (dt_actual.year - 1, 12)
+    mejor = None
+    for r in resumen:
+        if r["actividad"] in ACTIVIDADES_SIN_CUOTA or r["actividad"].startswith("Carnet") or not _es_de(r, nombre):
+            continue
+        dt = parsear_fecha(r["fecha"])
+        if not dt or (dt.year, dt.month) != mes_ant:
+            continue
+        if mejor is None or dt >= mejor[0]:
+            mejor = (dt, r)
+    if not mejor:
+        return None, None
+    vto_ant = parsear_fecha(mejor[1].get("vto", "")) if mejor[1].get("vto") else None
+    if not vto_ant:
+        return None, mejor[1]
+    return sumar_un_mes(vto_ant).strftime("%d/%m/%Y"), mejor[1]
 
 
 def buscar_recibo_previo_del_grupo(resumen, otros_miembros, fecha_emision):

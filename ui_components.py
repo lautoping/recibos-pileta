@@ -424,6 +424,11 @@ class AlumnoItem:
         self.var_nombre = tk.StringVar()
         self.var_usar_carnet = tk.BooleanVar(value=False)
         self.var_nro_carnet = tk.StringVar(value="")
+        self.var_cobrar_carnet = tk.BooleanVar(value=False)
+        self._vto_auto = None        # vto puesto por la app (vto del recibo anterior + 1 mes)
+        self._insc_cda_auto = False  # inscripción "CdA" puesta por la app
+        self._actualizando_previos = False
+        self.lbl_previos = None
         self.var_actividad = tk.StringVar(value="Natación")
         self.var_actividad_otro = tk.StringVar()
         self.var_clases_sem = tk.IntVar(value=2)
@@ -478,6 +483,10 @@ class AlumnoItem:
         self.lbl_dias_clase = ttk.Label(f_nom, text="", font=("Segoe UI", 8, "italic"), foreground="#0284c7")
         self.lbl_dias_clase.pack(anchor=tk.W, pady=(2, 0))
 
+        # Vencimiento calculado desde el recibo anterior y CdA previa
+        self.lbl_previos = ttk.Label(f_nom, text="", font=("Segoe UI", 8), foreground="#0f766e")
+        self.lbl_previos.pack(anchor=tk.W)
+
         # Grupo familiar (2da hoja de la planilla): otros integrantes, botones para sumarlos y dto. GF
         self.f_gf_info = ttk.Frame(f_nom)
         self.f_gf_info.pack(anchor=tk.W, fill=tk.X)
@@ -526,6 +535,14 @@ class AlumnoItem:
             state="disabled",
         )
         self.entry_carnet.pack(side=tk.LEFT)
+        precio_car = formatear_moneda(self.app.precios_data.get("carnet", 1000.0)) if getattr(self.app, "precios_data", None) else "$1.000"
+        self.chk_cobrar_carnet = ttk.Checkbutton(
+            f_car_in,
+            text=f"Cobrar ({precio_car})",
+            variable=self.var_cobrar_carnet,
+            state="disabled",
+        )
+        self.chk_cobrar_carnet.pack(side=tk.LEFT, padx=(4, 0))
 
         if not self.es_titular:
             f_btn_del = ttk.Frame(f1)
@@ -634,6 +651,8 @@ class AlumnoItem:
         cb = lambda *args: self.app._actualizar_calculo_precio()
         self.var_clases_sem.trace_add("write", cb)
         self.var_inscripcion.trace_add("write", cb)
+        self.var_inscripcion.trace_add("write", lambda *a: self.actualizar_datos_previos())
+        self.var_cobrar_carnet.trace_add("write", cb)
         self.var_descuento.trace_add("write", self._al_cambiar_descuento)
         self.var_gf_asociado.trace_add("write", cb)
         self.var_actividad.trace_add("write", cb)
@@ -653,7 +672,7 @@ class AlumnoItem:
             self.app._actualizar_calculo_precio()
             return
 
-        norm = quitar_tildes(nom).lower().strip()
+        norm = quitar_tildes(" ".join(nom.split()))
         detalles = getattr(self.app, "detalles_alumnos", {})
         det = detalles.get(norm) or detalles.get(nom)
 
@@ -811,6 +830,74 @@ class AlumnoItem:
         else:
             self.entry_carnet.config(state="disabled")
             self.var_nro_carnet.set("")
+            self.var_cobrar_carnet.set(False)
+        if hasattr(self, "chk_cobrar_carnet"):
+            self.chk_cobrar_carnet.config(state="normal" if self.var_usar_carnet.get() else "disabled")
+        self.app._actualizar_calculo_precio()
+
+    def monto_carnet(self):
+        """Precio del carnet si se cobra junto con la cuota en este recibo."""
+        if self.var_usar_carnet.get() and self.var_cobrar_carnet.get():
+            return float(self.app.precios_data.get("carnet", 1000.0))
+        return 0.0
+
+    def actualizar_datos_previos(self):
+        """
+        Según los recibos anteriores del alumno:
+        - Vencimiento = vto del recibo del mes anterior + 1 mes (si existe ese recibo).
+        - Si tiene una CdA y todavía no pagó una cuota después, marca inscripción 'CdA' ($0).
+        """
+        if self._actualizando_previos or not self.lbl_previos or not hasattr(self.app, "vto_desde_anterior"):
+            return
+        self._actualizando_previos = True
+        try:
+            nom = " ".join(self.var_nombre.get().split())
+            act = self.var_actividad.get()
+            textos = []
+
+            # --- Vencimiento automático ---
+            vto, ant = (None, None)
+            if nom and act not in ("Clase Adaptación (CdA)", "Solo Inscripción"):
+                vto, ant = self.app.vto_desde_anterior(nom)
+            actual = self.var_fecha_vencimiento.get().strip()
+            general = self.app.var_fecha_vencimiento.get().strip() if hasattr(self.app, "var_fecha_vencimiento") else ""
+            if vto:
+                if actual in ("", general, self._vto_auto or ""):
+                    self.var_fecha_vencimiento.set(vto)
+                self._vto_auto = vto
+                textos.append(
+                    f"📅 Vto {vto[:5]} = vto anterior {ant['vto'][:5]} + 1 mes (R{ant['nro']} del {ant['fecha'][:5]})"
+                )
+            else:
+                if self._vto_auto and actual == self._vto_auto and act != "Clase Adaptación (CdA)":
+                    self.var_fecha_vencimiento.set(general)
+                self._vto_auto = None
+                if ant:
+                    textos.append(f"📅 El recibo anterior (R{ant['nro']} del {ant['fecha'][:5]}) no tiene vto: se usa el general")
+
+            # --- CdA previa ---
+            cda = self.app.cda_previa(nom) if nom and act != "Clase Adaptación (CdA)" else None
+            cda_vigente = bool(cda) and not self.app.tiene_cuota_desde(nom, cda["fecha"])
+            insc = self.var_inscripcion.get()
+            if cda_vigente and insc == "No" and act not in ("Clase Adaptación (CdA)",):
+                self._insc_cda_auto = True
+                self.var_inscripcion.set("CdA")
+                insc = "CdA"
+            elif self._insc_cda_auto and not cda_vigente and insc == "CdA":
+                self.var_inscripcion.set("No")
+                insc = "No"
+                self._insc_cda_auto = False
+            if insc != "CdA":
+                self._insc_cda_auto = False
+            if insc == "CdA":
+                if cda:
+                    textos.append(f"🏊 CdA previa: R{cda['nro']} del {cda['fecha'][:5]} (inscripción $0)")
+                elif nom:
+                    textos.append("⚠️ No encontré una CdA anterior de este alumno")
+
+            self.lbl_previos.config(text="   ".join(textos))
+        finally:
+            self._actualizando_previos = False
 
     def _al_cambiar_actividad(self):
         act = self.var_actividad.get()
@@ -879,6 +966,11 @@ class AlumnoItem:
             w.config(state=st)
 
     def obtener_montos(self):
+        """(cuota, inscripción, subtotal). El subtotal suma el carnet si se cobra en este recibo."""
+        cuota, insc, subtotal = self._obtener_montos_base()
+        return cuota, insc, subtotal + self.monto_carnet()
+
+    def _obtener_montos_base(self):
         actividad = self.var_actividad.get()
         precio_inscripcion_base = float(self.app.precios_data.get("inscripcion", 15000.0))
 
@@ -994,6 +1086,8 @@ class AlumnoItem:
                 f"{insc_txt})"
             )
 
+        if self.monto_carnet() > 0:
+            txt = txt.rstrip(")") + f" | Carnet: {formatear_moneda(self.monto_carnet())})"
         if self.lbl_subtotal:
             self.lbl_subtotal.config(text=txt)
 

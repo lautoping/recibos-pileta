@@ -22,6 +22,8 @@ def extraer_dias_clase(texto):
     if not texto or not str(texto).strip() or str(texto).lower() == "nan":
         return ""
     t = quitar_tildes(str(texto).lower())
+    # Días pegados a la "y" (ej: martesy jueves -> martes y jueves)
+    t = re.sub(r"(lunes|martes|miercoles|jueves|viernes|sabados?|domingos?)y\b", r"\1 y", t)
     # Separar letras y números (ej: viernes10 -> viernes 10, j15 -> j 15)
     t = re.sub(r"([a-z])(\d)", r"\1 \2", t)
     t = re.sub(r"[^a-z0-9\s]", " ", t)
@@ -30,7 +32,7 @@ def extraer_dias_clase(texto):
         ("Lunes", r"\b(lunes|lun|lu|l)\b"),
         ("Martes", r"\b(martes|mar|ma|m)\b"),
         ("Miércoles", r"\b(miercoles|m.ercoles|mier|mie|mi)\b"),
-        ("Jueves", r"\b(jueves|jue|ju|j)\b"),
+        ("Jueves", r"\b(jueves|jueve|juves|juevez|jue|ju|j)\b"),
         ("Viernes", r"\b(viernes|vier|vie|vi|v)\b"),
         ("Sábado", r"\b(sabados?|s.bados?|sabdo|sabao|sab|sa)\b"),
         ("Domingo", r"\b(domingos?|dom|do)\b"),
@@ -77,7 +79,8 @@ def extraer_datos_alumnos_dataframe(df):
         if not nombre_str or nombre_str.lower() == "nan":
             continue
 
-        norm = quitar_tildes(nombre_str).lower().strip()
+        # Espacios dobles o al final ("malena rincon  (asma)") no deben cambiar la clave
+        norm = quitar_tildes(" ".join(nombre_str.split()))
         if norm in ("nombre", "nombres", "alumno", "alumnos", "apellido y nombre", "nombre y apellido", "socio"):
             continue
 

@@ -29,6 +29,9 @@ from excel_manager import (
     nombre_hoja_mes,
     resumen_recibos,
     buscar_recibo_previo_del_grupo,
+    buscar_cda_previa,
+    calcular_vto_desde_recibo_anterior,
+    ACTIVIDADES_SIN_CUOTA,
 )
 from alumnos_service import (
     cargar_cache_alumnos,
@@ -816,6 +819,28 @@ class ReemplazoCuadernoApp:
         otros = [m for m in grupo["miembros"] if quitar_tildes(m) != quitar_tildes(nombre)]
         return buscar_recibo_previo_del_grupo(self.resumen_recibos, otros, self.var_fecha_emision.get())
 
+    def vto_desde_anterior(self, nombre):
+        """(vto nuevo, recibo anterior) si el alumno tiene recibo de cuota en el mes anterior."""
+        return calcular_vto_desde_recibo_anterior(self.resumen_recibos, nombre, self.var_fecha_emision.get())
+
+    def cda_previa(self, nombre):
+        """La CdA más reciente del alumno, o None."""
+        return buscar_cda_previa(self.resumen_recibos, nombre, self.var_fecha_emision.get())
+
+    def tiene_cuota_desde(self, nombre, fecha_desde):
+        """True si el alumno ya tiene un recibo de cuota emitido desde esa fecha (o sea, la CdA ya se usó)."""
+        dt_desde = parsear_fecha(fecha_desde)
+        clave = quitar_tildes(" ".join(nombre.split()))
+        for r in self.resumen_recibos:
+            if r["actividad"] in ACTIVIDADES_SIN_CUOTA or r["actividad"].startswith("Carnet"):
+                continue
+            if quitar_tildes(" ".join(r["nombre"].split())) != clave:
+                continue
+            dt = parsear_fecha(r["fecha"])
+            if dt and dt_desde and dt >= dt_desde:
+                return True
+        return False
+
     def agregar_miembro_gf(self, nombre):
         """Agrega al recibo a otro integrante del grupo familiar con el nombre ya cargado."""
         self._agregar_alumno()
@@ -825,6 +850,7 @@ class ReemplazoCuadernoApp:
     def _refrescar_info_gf(self):
         for it in self.alumnos_items:
             it.actualizar_info_gf()
+            it.actualizar_datos_previos()
 
     def _abrir_dialogo_alumnos(self):
         def al_guardar():
@@ -896,7 +922,8 @@ class ReemplazoCuadernoApp:
 
     def _propagar_vencimiento_a_alumnos(self, venc_str):
         for item in self.alumnos_items:
-            if item.var_actividad.get() != "Clase Adaptación (CdA)":
+            # Los alumnos con vto calculado desde su recibo anterior conservan ese vto
+            if item.var_actividad.get() != "Clase Adaptación (CdA)" and not getattr(item, "_vto_auto", None):
                 item.var_fecha_vencimiento.set(venc_str)
 
     def _al_cambiar_tipo_mixto(self):
@@ -1204,7 +1231,8 @@ class ReemplazoCuadernoApp:
             monto_insc_tot += i
             subtotales_alumnos.append((c, i, s))
 
-        total_calculado = monto_cuota_tot + monto_insc_tot
+        # El subtotal incluye el carnet cuando se cobra junto con la cuota
+        total_calculado = sum(s for _, _, s in subtotales_alumnos)
 
         if self.var_editar_total_manual.get():
             try:
@@ -1277,6 +1305,17 @@ class ReemplazoCuadernoApp:
 
         obs_completa = f"{user_obs} | {obs_extra}".strip(" |") if obs_extra else user_obs
 
+        def agregar_nota(obs, nota):
+            """Suma una nota a Observaciones si no está ya escrita (sin importar mayúsculas)."""
+            if quitar_tildes(nota).rstrip(".") in quitar_tildes(obs):
+                return obs
+            return f"{obs} | {nota}".strip(" |") if obs else nota
+
+        # Datos que no figuran en el talonario: se anotan solos en Observaciones.
+        # (Si debe todo, no hay método de pago que anotar.)
+        if mp == "No figura" and estado_pago != "Debe":
+            obs_completa = agregar_nota(obs_completa, "No figura método de pago")
+
         filas_a_guardar = []
         restante_abonado = total_abonado
         fuera_termino = self.var_pago_vencido.get()
@@ -1329,7 +1368,16 @@ class ReemplazoCuadernoApp:
             if tipo_insc_al in ("Ticket Sochi", "Ticket Malva", "Sochi", "Malva"):
                 obs_alumno = f"{obs_alumno} [{tipo_insc_al} presentado - Inscripción $0]".strip()
             elif tipo_insc_al == "CdA":
-                obs_alumno = f"{obs_alumno} [CdA previa abonada - Inscripción $0]".strip()
+                cda = self.cda_previa(nombre_al)
+                if cda:
+                    obs_alumno = agregar_nota(obs_alumno, f"CdA R{cda['nro']} del {cda['fecha'][:5]} [Inscripción $0]")
+                else:
+                    obs_alumno = f"{obs_alumno} [CdA previa abonada - Inscripción $0]".strip()
+
+            if item.var_usar_carnet.get() and item.monto_carnet() > 0:
+                obs_alumno = agregar_nota(
+                    obs_alumno, f"Carnet N°{item.var_nro_carnet.get().strip()} cobrado {formatear_moneda(item.monto_carnet())}"
+                )
 
             if fuera_termino and actividad_al not in ("Clase Adaptación (CdA)", "Solo Inscripción"):
                 obs_alumno = f"{obs_alumno} [Pago fuera de término - Sin dto.]".strip()
@@ -1342,6 +1390,12 @@ class ReemplazoCuadernoApp:
                     obs_alumno = f"{obs_alumno} {gf_txt}".strip() if obs_alumno else gf_txt
 
             fecha_venc_al = fechas_venc_alumnos[idx]
+
+            # Excepciones: la Clase de Adaptación (CdA) y "Solo Inscripción" no llevan vencimiento
+            if actividad_al == "No figura":
+                obs_alumno = agregar_nota(obs_alumno, "No figura actividad")
+            if not fecha_venc_al and actividad_al not in ("Clase Adaptación (CdA)", "Solo Inscripción"):
+                obs_alumno = agregar_nota(obs_alumno, "No figura vto.")
 
             fila_datos = {
                 "Nro Recibo": nro_recibo,
