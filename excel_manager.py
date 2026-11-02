@@ -1,5 +1,9 @@
 import os
 import re
+import shutil
+import tempfile
+import time
+from copy import copy
 from datetime import datetime, date
 import pandas as pd
 from openpyxl import Workbook, load_workbook
@@ -7,7 +11,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from config import COLUMNAS_RECIBOS
-from utils import quitar_tildes, parsear_fecha, formatear_moneda
+from utils import quitar_tildes, parsear_fecha, formatear_moneda, limpiar_monto
 
 
 def crear_excel_precios_por_defecto(ruta_precios):
@@ -106,7 +110,7 @@ def cargar_tabla_precios(ruta_precios):
                 else:
                     if c_idx + 1 < len(fila) and not pd.isna(fila.iloc[c_idx + 1]):
                         try:
-                            inscripcion_val = float(str(fila.iloc[c_idx + 1]).replace("$", "").replace(".", "").strip())
+                            inscripcion_val = float(limpiar_monto(fila.iloc[c_idx + 1]))
                         except ValueError:
                             pass
 
@@ -120,7 +124,7 @@ def cargar_tabla_precios(ruta_precios):
                 else:
                     if c_idx + 1 < len(fila) and not pd.isna(fila.iloc[c_idx + 1]):
                         try:
-                            carnet_val = float(str(fila.iloc[c_idx + 1]).replace("$", "").replace(".", "").strip())
+                            carnet_val = float(limpiar_monto(fila.iloc[c_idx + 1]))
                         except ValueError:
                             pass
 
@@ -159,7 +163,7 @@ def cargar_tabla_precios(ruta_precios):
                 for desc_key, col_i in mapa_columnas.items():
                     if col_i < len(fila) and not pd.isna(fila.iloc[col_i]):
                         try:
-                            limpio = str(fila.iloc[col_i]).replace("$", "").replace(" ", "").strip()
+                            limpio = limpiar_monto(fila.iloc[col_i])
                             precios_default["cuotas"][clases_sem][desc_key] = float(limpio)
                         except ValueError:
                             pass
@@ -170,75 +174,286 @@ def cargar_tabla_precios(ruta_precios):
     return precios_default
 
 
-def asegurar_excel_recibos(ruta_recibos):
-    """Crea o actualiza recibos.xlsx con los encabezados y columnas correctos."""
-    borde_fino = Border(
-        bottom=Side(style="thin", color="E2E8F0"),
-        left=Side(style="thin", color="E2E8F0"),
-        right=Side(style="thin", color="E2E8F0"),
-        top=Side(style="thin", color="E2E8F0"),
-    )
-    fill_header = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
-    font_header = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
-    anchos = [12, 14, 28, 14, 24, 16, 16, 12, 16, 16, 13, 14, 16, 14, 15, 16, 14, 30]
+# ==========================================================
+# HOJAS POR MES, GUARDADO SEGURO Y COPIAS DE SEGURIDAD
+# ==========================================================
+# Cada mes tiene su propia hoja dentro de recibos.xlsx ("Octubre 2026", "Noviembre 2026", ...).
+# Un recibo va a la hoja del mes de su Fecha de Emisión. Las deudas se buscan en TODAS las hojas,
+# así que una deuda del mes pasado sigue apareciendo hasta que se cobra.
+
+MESES = [
+    "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+]
+CARPETA_COPIAS = "copias_seguridad"
+COPIAS_A_CONSERVAR = 60
+
+COL_NRO, COL_FECHA, COL_NOMBRE, COL_ACTIVIDAD = 1, 2, 3, 4
+COL_METODO, COL_TOTAL, COL_PAGADO, COL_SALDO, COL_ESTADO, COL_OBS = 10, 14, 15, 16, 17, 18
+
+ACTIVIDADES_NO_RECIBO = ("Cobro de Saldo",)
+
+_BORDE = Border(
+    bottom=Side(style="thin", color="E2E8F0"),
+    left=Side(style="thin", color="E2E8F0"),
+    right=Side(style="thin", color="E2E8F0"),
+    top=Side(style="thin", color="E2E8F0"),
+)
+_FILL_HEADER = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+_FONT_HEADER = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
+_FONT_NORMAL = Font(name="Segoe UI", size=10)
+_ANCHOS = [12, 14, 28, 14, 24, 16, 16, 12, 16, 16, 13, 14, 16, 14, 15, 16, 14, 30]
+
+
+def nombre_hoja_mes(fecha):
+    """'Noviembre 2026' para una fecha (date o texto DD/MM/AAAA). None si no se puede leer."""
+    if isinstance(fecha, (datetime, date)):
+        dt = fecha
+    else:
+        dt = parsear_fecha(fecha) if fecha else None
+    if not dt:
+        return None
+    return f"{MESES[dt.month - 1]} {dt.year}"
+
+
+def _clave_hoja(titulo):
+    """(año, mes) de una hoja mensual, o None si la hoja no es de un mes."""
+    partes = str(titulo).strip().split()
+    if len(partes) != 2 or not partes[1].isdigit():
+        return None
+    meses_norm = [quitar_tildes(m) for m in MESES]
+    mes = quitar_tildes(partes[0])
+    if mes not in meses_norm:
+        return None
+    return int(partes[1]), meses_norm.index(mes) + 1
+
+
+def _hojas_ordenadas(wb):
+    """Hojas mensuales de la más vieja a la más nueva."""
+    hojas = [ws for ws in wb.worksheets if _clave_hoja(ws.title)]
+    return sorted(hojas, key=lambda ws: _clave_hoja(ws.title))
+
+
+def _preparar_hoja(ws):
+    for col_idx, col_name in enumerate(COLUMNAS_RECIBOS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.fill = _FILL_HEADER
+        cell.font = _FONT_HEADER
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for idx, ancho in enumerate(_ANCHOS, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = ancho
+    ws.freeze_panes = "A2"
+
+
+def _obtener_o_crear_hoja(wb, titulo):
+    if titulo in wb.sheetnames:
+        return wb[titulo], False
+    ws = wb.create_sheet(titulo)
+    _preparar_hoja(ws)
+    # Ubicar las hojas en orden cronológico (las que no son de un mes quedan al final)
+    wb._sheets.sort(key=lambda w: (0, _clave_hoja(w.title)) if _clave_hoja(w.title) else (1, (0, 0)))
+    return ws, True
+
+
+def _fila_vacia(ws, r):
+    return all(ws.cell(row=r, column=c).value in (None, "") for c in range(1, len(COLUMNAS_RECIBOS) + 1))
+
+
+def _ultima_fila_con_datos(ws):
+    r = ws.max_row
+    while r > 1 and _fila_vacia(ws, r):
+        r -= 1
+    return r
+
+
+def _copia_de_seguridad(ruta):
+    """Guarda una copia del archivo tal como estaba, una vez por día (antes del primer cambio del día)."""
+    if not os.path.exists(ruta) or os.path.getsize(ruta) == 0:
+        return
+    carpeta = os.path.join(os.path.dirname(os.path.abspath(ruta)), CARPETA_COPIAS)
+    base = os.path.splitext(os.path.basename(ruta))[0]
+    destino = os.path.join(carpeta, f"{base}_{date.today().strftime('%Y-%m-%d')}.xlsx")
+    if os.path.exists(destino):
+        return
+    try:
+        os.makedirs(carpeta, exist_ok=True)
+        shutil.copy2(ruta, destino)
+        copias = sorted(f for f in os.listdir(carpeta) if f.startswith(base + "_") and f.endswith(".xlsx"))
+        for viejo in copias[:-COPIAS_A_CONSERVAR]:
+            try:
+                os.remove(os.path.join(carpeta, viejo))
+            except OSError:
+                pass
+    except Exception as e:
+        print(f"Aviso: no se pudo crear la copia de seguridad: {e}")
+
+
+def _guardar_wb(wb, ruta):
+    """
+    Guarda sin riesgo de dejar el Excel a medio escribir: primero en un archivo temporal
+    y después lo reemplaza de una sola vez. Si recibos.xlsx está abierto en Excel, lanza PermissionError.
+    """
+    _copia_de_seguridad(ruta)
+    carpeta = os.path.dirname(os.path.abspath(ruta))
+    fd, tmp = tempfile.mkstemp(prefix="~guardando_", suffix=".xlsx", dir=carpeta)
+    os.close(fd)
+    try:
+        wb.save(tmp)
+        # OneDrive puede tener el archivo tomado un instante mientras sincroniza: reintentar un poco
+        for intento in range(4):
+            try:
+                os.replace(tmp, ruta)
+                break
+            except PermissionError:
+                if intento == 3:
+                    raise
+                time.sleep(0.5)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _migrar_columnas_antiguas(ws):
+    """Recibos viejos sin las columnas de pago: Monto Pagado = Total, Saldo 0, Pagado."""
+    headers_actuales = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+    if "Monto Pagado" in headers_actuales:
+        return False
+    for r in range(2, ws.max_row + 1):
+        total_val = ws.cell(row=r, column=14).value or 0
+        obs_val = ws.cell(row=r, column=15).value
+        ws.cell(row=r, column=15, value=total_val)
+        ws.cell(row=r, column=16, value=0)
+        ws.cell(row=r, column=17, value="Pagado")
+        ws.cell(row=r, column=18, value=obs_val)
+    _preparar_hoja(ws)
+    for r in range(2, ws.max_row + 1):
+        _formatear_fila(ws, r, "Pagado")
+    return True
+
+
+def _separar_hoja_por_mes(wb, ws):
+    """
+    Pasa una hoja vieja (ej. 'Recibos') a hojas mensuales según la Fecha de Emisión.
+    Las filas sin fecha quedan en el mes de la fila anterior.
+    Si todo es de un solo mes, solo renombra la hoja (conserva todo el formato).
+    """
+    ultima = _ultima_fila_con_datos(ws)
+    meses_fila = []
+    mes_actual = None
+    for r in range(2, ultima + 1):
+        m = nombre_hoja_mes(ws.cell(row=r, column=COL_FECHA).value)
+        if m:
+            mes_actual = m
+        meses_fila.append(mes_actual)
+    primer_mes = next((m for m in meses_fila if m), None) or nombre_hoja_mes(date.today())
+    meses_fila = [m or primer_mes for m in meses_fila]
+    distintos = list(dict.fromkeys(meses_fila))
+
+    if len(distintos) <= 1 and primer_mes not in wb.sheetnames:
+        ws.title = primer_mes
+        ws.freeze_panes = "A2"
+        return
+
+    for r, mes in zip(range(2, ultima + 1), meses_fila):
+        destino, _ = _obtener_o_crear_hoja(wb, mes)
+        nueva = _ultima_fila_con_datos(destino) + 1
+        for c in range(1, len(COLUMNAS_RECIBOS) + 1):
+            origen = ws.cell(row=r, column=c)
+            celda = destino.cell(row=nueva, column=c, value=origen.value)
+            if origen.has_style:
+                celda._style = copy(origen._style)
+    wb.remove(ws)
+
+
+def asegurar_excel_recibos(ruta_recibos, fecha_referencia=None):
+    """
+    Crea o actualiza recibos.xlsx:
+    - Una hoja por mes, con encabezados y formato.
+    - Pasa la hoja vieja 'Recibos' (o cualquier hoja que no sea de un mes) a hojas mensuales.
+    - Crea la hoja del mes actual si todavía no existe (el cambio de mes es automático).
+    """
+    mes_actual = nombre_hoja_mes(fecha_referencia or date.today())
 
     if not os.path.exists(ruta_recibos) or os.path.getsize(ruta_recibos) == 0:
         wb = Workbook()
         ws = wb.active
-        ws.title = "Recibos"
-        ws.append(COLUMNAS_RECIBOS)
-
-        for col_idx in range(1, len(COLUMNAS_RECIBOS) + 1):
-            cell = ws.cell(row=1, column=col_idx)
-            cell.fill = fill_header
-            cell.font = font_header
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-
-        for idx, ancho in enumerate(anchos, start=1):
-            ws.column_dimensions[get_column_letter(idx)].width = ancho
-
-        wb.save(ruta_recibos)
+        ws.title = mes_actual
+        _preparar_hoja(ws)
+        _guardar_wb(wb, ruta_recibos)
         return
 
-    # Si ya existe, verificar si requiere migrar columnas antiguas
     try:
         wb = load_workbook(ruta_recibos)
-        ws = wb.active
-        headers_actuales = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+        cambio = False
+        for ws in list(wb.worksheets):
+            if _clave_hoja(ws.title):
+                cambio = _migrar_columnas_antiguas(ws) or cambio
+                continue
+            encabezado = str(ws.cell(row=1, column=1).value or "").strip()
+            if encabezado == "Nro Recibo":
+                cambio = _migrar_columnas_antiguas(ws) or cambio
+                _separar_hoja_por_mes(wb, ws)
+                cambio = True
 
-        if "Monto Pagado" not in headers_actuales:
-            for r in range(2, ws.max_row + 1):
-                total_val = ws.cell(row=r, column=14).value or 0
-                obs_val = ws.cell(row=r, column=15).value
+        if mes_actual not in wb.sheetnames:
+            _obtener_o_crear_hoja(wb, mes_actual)
+            cambio = True
 
-                ws.cell(row=r, column=15, value=total_val)       # Monto Pagado = Total
-                ws.cell(row=r, column=16, value=0)               # Saldo Pendiente = 0
-                ws.cell(row=r, column=17, value="Pagado")        # Estado Pago = "Pagado"
-                ws.cell(row=r, column=18, value=obs_val)         # Observaciones
-
-            for col_idx, col_name in enumerate(COLUMNAS_RECIBOS, start=1):
-                cell = ws.cell(row=1, column=col_idx, value=col_name)
-                cell.fill = fill_header
-                cell.font = font_header
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-
-            for idx, ancho in enumerate(anchos, start=1):
-                ws.column_dimensions[get_column_letter(idx)].width = ancho
-
-            for r in range(2, ws.max_row + 1):
-                for c in range(1, len(COLUMNAS_RECIBOS) + 1):
-                    cell = ws.cell(row=r, column=c)
-                    cell.font = Font(name="Segoe UI", size=10)
-                    cell.border = borde_fino
-                    if c in (1, 2, 6, 7, 8, 11, 17):
-                        cell.alignment = Alignment(horizontal="center")
-                    elif c in (12, 13, 14, 15, 16):
-                        cell.number_format = "$#,##0"
-                        cell.alignment = Alignment(horizontal="right")
-
-            wb.save(ruta_recibos)
+        if cambio:
+            hojas = _hojas_ordenadas(wb)
+            if hojas:
+                wb.active = wb.worksheets.index(hojas[-1])
+            _guardar_wb(wb, ruta_recibos)
+    except PermissionError:
+        raise
     except Exception as e:
-        print(f"Aviso migrando Excel de recibos: {e}")
+        print(f"Aviso preparando el Excel de recibos: {e}")
+
+
+def _leer_filas(wb):
+    """Devuelve todas las filas de todas las hojas mensuales en orden cronológico, como dicts."""
+    filas = []
+    for ws in _hojas_ordenadas(wb):
+        for r in range(2, _ultima_fila_con_datos(ws) + 1):
+            valores = [ws.cell(row=r, column=c).value for c in range(1, len(COLUMNAS_RECIBOS) + 1)]
+            if all(v in (None, "") for v in valores):
+                continue
+            d = {col: ("" if v is None else v) for col, v in zip(COLUMNAS_RECIBOS, valores)}
+            d["_hoja"] = ws.title
+            d["_fila"] = r
+            filas.append(d)
+    return filas
+
+
+def _a_numero(valor):
+    try:
+        if valor is None or str(valor).strip() == "":
+            return 0.0
+        return float(valor)
+    except (ValueError, TypeError):
+        try:
+            return float(limpiar_monto(valor))
+        except ValueError:
+            return 0.0
+
+
+def _nro_normalizado(valor):
+    """'R12', 12, 12.0 y ' 12 ' -> '12'."""
+    if valor is None:
+        return ""
+    if isinstance(valor, float) and valor.is_integer():
+        valor = int(valor)
+    return str(valor).strip().lstrip("Rr").strip()
+
+
+def _fecha_normalizada(valor):
+    if isinstance(valor, (datetime, date)):
+        return valor.strftime("%d/%m/%Y")
+    dt = parsear_fecha(valor) if valor not in (None, "") else None
+    return dt.strftime("%d/%m/%Y") if dt else str(valor or "").strip()
 
 
 def obtener_estado_recibos(ruta_recibos):
@@ -247,164 +462,223 @@ def obtener_estado_recibos(ruta_recibos):
     - proximo_recibo (int)
     - proximo_carnet (int)
     - ultima_fecha_emision (str DD/MM/YYYY o None)
-    - ultimos_registros (lista de dicts para la tabla)
+    - ultimos_registros (lista de dicts para la tabla, el más nuevo primero)
     """
     asegurar_excel_recibos(ruta_recibos)
     try:
-        df = pd.read_excel(ruta_recibos)
+        wb = load_workbook(ruta_recibos, data_only=True)
     except Exception:
         return 1, 1, None, []
 
-    if df.empty:
+    filas = _leer_filas(wb)
+    if not filas:
         return 1, 1, None, []
 
+    # Se recorre desde el final para respetar cuando se termina un talonario y se reinicia desde 1
     proximo_recibo = 1
-    if "Nro Recibo" in df.columns:
-        # Buscar el último recibo emitido recorriendo el archivo desde el final hacia el inicio
-        # para respetar cuando se termina un talonario y se reinicia desde 1
-        for idx in range(len(df) - 1, -1, -1):
-            val_rec = df.at[idx, "Nro Recibo"]
-            act_val = str(df.at[idx, "Actividad"]) if "Actividad" in df.columns and not pd.isna(df.at[idx, "Actividad"]) else ""
-            if act_val == "Cobro de Saldo" or act_val.startswith("Carnet"):
-                continue
-
-            if not pd.isna(val_rec):
-                m = re.match(r"^\s*[Rr]?\s*(\d+)", str(val_rec).strip())
-                if m:
-                    proximo_recibo = int(m.group(1)) + 1
-                    break
+    for f in reversed(filas):
+        act_val = str(f.get("Actividad", ""))
+        if act_val in ACTIVIDADES_NO_RECIBO or act_val.startswith("Carnet"):
+            continue
+        m = re.match(r"^\s*[Rr]?\s*(\d+)", _nro_normalizado(f.get("Nro Recibo")))
+        if m:
+            proximo_recibo = int(m.group(1)) + 1
+            break
 
     proximo_carnet = 1
-    if "Nro Carnet" in df.columns:
-        # Buscar el último carnet asignado recorriendo desde el final hacia el inicio
-        # para respetar cuando se termina una caja/serie de carnets y se reinicia desde 1
-        for idx in range(len(df) - 1, -1, -1):
-            val_car = df.at[idx, "Nro Carnet"]
-            if not pd.isna(val_car):
-                m = re.search(r"\b(\d+)\b", str(val_car).strip())
-                if m:
-                    proximo_carnet = int(m.group(1)) + 1
-                    break
+    for f in reversed(filas):
+        val_car = f.get("Nro Carnet")
+        if val_car not in (None, ""):
+            m = re.search(r"\b(\d+)\b", _nro_normalizado(val_car))
+            if m:
+                proximo_carnet = int(m.group(1)) + 1
+                break
 
     ultima_fecha_emision = None
-    if "Fecha Emisión" in df.columns:
-        fechas_no_nulas = df["Fecha Emisión"].dropna()
-        if not fechas_no_nulas.empty:
-            ult_val = fechas_no_nulas.iloc[-1]
-            if isinstance(ult_val, (datetime, date, pd.Timestamp)):
-                ultima_fecha_emision = ult_val.strftime("%d/%m/%Y")
-            else:
-                dt_parsed = parsear_fecha(str(ult_val))
-                if dt_parsed:
-                    ultima_fecha_emision = dt_parsed.strftime("%d/%m/%Y")
-                else:
-                    ultima_fecha_emision = str(ult_val).strip()
+    for f in reversed(filas):
+        if f.get("Fecha Emisión") not in (None, ""):
+            ultima_fecha_emision = _fecha_normalizada(f["Fecha Emisión"])
+            break
 
-    ultimos = df.tail(35).fillna("").to_dict(orient="records")
+    ultimos = filas[-35:]
     ultimos.reverse()
     return proximo_recibo, proximo_carnet, ultima_fecha_emision, ultimos
 
 
-def guardar_fila_recibo(ruta_recibos, fila_datos):
-    """
-    Agrega una fila al final de recibos.xlsx manteniendo el formato.
-    Si el estado de pago es 'Parcial', pinta las celdas de Saldo Pendiente y Estado en amarillo.
-    Si el estado de pago es 'Debe' (debe todo), las pinta en rojo.
-    """
-    asegurar_excel_recibos(ruta_recibos)
-    wb = load_workbook(ruta_recibos)
-    ws = wb.active
-
-    valores = [fila_datos.get(col, "") for col in COLUMNAS_RECIBOS]
-    ws.append(valores)
-
-    ultima_fila = ws.max_row
-    borde_fila = Border(
-        bottom=Side(style="thin", color="E2E8F0"),
-        left=Side(style="thin", color="E2E8F0"),
-        right=Side(style="thin", color="E2E8F0"),
-        top=Side(style="thin", color="E2E8F0"),
-    )
-
-    estado = fila_datos.get("Estado Pago", "Pagado")
-
+def _formatear_fila(ws, fila, estado):
+    """Formato de una fila; Saldo y Estado en amarillo si es 'Parcial' y en rojo si es 'Debe'."""
     fill_alerta = None
     font_alerta = None
-
     if estado == "Parcial":
-        # Amarillo para pago parcial (a medias)
         fill_alerta = PatternFill(start_color="FEF08A", end_color="FEF08A", fill_type="solid")
         font_alerta = Font(name="Segoe UI", size=10, bold=True, color="854D0E")
     elif estado == "Debe":
-        # Rojo para debe todo
         fill_alerta = PatternFill(start_color="FECACA", end_color="FECACA", fill_type="solid")
         font_alerta = Font(name="Segoe UI", size=10, bold=True, color="991B1B")
 
     for col_idx in range(1, len(COLUMNAS_RECIBOS) + 1):
-        c = ws.cell(row=ultima_fila, column=col_idx)
-        c.font = Font(name="Segoe UI", size=10)
-        c.border = borde_fila
+        c = ws.cell(row=fila, column=col_idx)
+        c.font = _FONT_NORMAL
+        c.border = _BORDE
         if col_idx in (1, 2, 6, 7, 8, 11, 17):
             c.alignment = Alignment(horizontal="center")
         elif col_idx in (12, 13, 14, 15, 16):
             if c.value != "" and c.value is not None:
                 c.number_format = "$#,##0"
             c.alignment = Alignment(horizontal="right")
+        if col_idx in (COL_SALDO, COL_ESTADO):
+            if fill_alerta:
+                c.fill = fill_alerta
+                c.font = font_alerta
+            else:
+                c.fill = PatternFill(fill_type=None)
 
-        # Pintar recuadros de Saldo Pendiente (col 16) y Estado Pago (col 17)
-        if fill_alerta and col_idx in (16, 17):
-            c.fill = fill_alerta
-            c.font = font_alerta
 
-    wb.save(ruta_recibos)
+def _agregar_fila(wb, fila_datos):
+    """Agrega la fila en la hoja del mes de su Fecha de Emisión (o del mes actual si no tiene)."""
+    mes = nombre_hoja_mes(fila_datos.get("Fecha Emisión")) or nombre_hoja_mes(date.today())
+    ws, _ = _obtener_o_crear_hoja(wb, mes)
+    nueva = _ultima_fila_con_datos(ws) + 1
+    for col_idx, col in enumerate(COLUMNAS_RECIBOS, start=1):
+        valor = fila_datos.get(col, "")
+        ws.cell(row=nueva, column=col_idx, value=None if valor == "" else valor)
+    _formatear_fila(ws, nueva, fila_datos.get("Estado Pago", "Pagado"))
+    return ws, nueva
 
 
-def eliminar_recibo_por_numero(ruta_recibos, nro_recibo):
-    """Elimina todas las filas cuyo Nro Recibo coincida con nro_recibo."""
+def guardar_filas_recibo(ruta_recibos, filas_datos):
+    """Guarda todas las filas de un recibo (ej. grupo familiar) en un solo guardado: o se guardan todas o ninguna."""
+    asegurar_excel_recibos(ruta_recibos)
     wb = load_workbook(ruta_recibos)
-    ws = wb.active
-    filas_a_borrar = []
+    for fila in filas_datos:
+        _agregar_fila(wb, fila)
+    _guardar_wb(wb, ruta_recibos)
 
-    for row_idx in range(ws.max_row, 1, -1):
-        val = ws.cell(row=row_idx, column=1).value
-        if val is not None and str(val).strip() == str(nro_recibo).strip():
-            filas_a_borrar.append(row_idx)
 
-    if filas_a_borrar:
-        for r_idx in filas_a_borrar:
-            ws.delete_rows(r_idx, 1)
-        wb.save(ruta_recibos)
-        return True
-    return False
+def guardar_fila_recibo(ruta_recibos, fila_datos):
+    """Agrega una fila al final de la hoja del mes correspondiente manteniendo el formato."""
+    guardar_filas_recibo(ruta_recibos, [fila_datos])
+
+
+def _filas_del_recibo(ws, nro_recibo, fecha_emision, fila_ref=None):
+    """
+    Filas de una hoja con ese N° de recibo Y esa fecha de emisión (un mismo recibo, aunque sea grupal).
+    Con fila_ref, solo el bloque de filas seguidas que la contiene (las personas de un recibo grupal
+    se guardan juntas), así no se mezcla con otro recibo cargado con el mismo número el mismo día.
+    """
+    nro = _nro_normalizado(nro_recibo)
+    fecha = _fecha_normalizada(fecha_emision)
+
+    def coincide(r):
+        return (
+            _nro_normalizado(ws.cell(row=r, column=COL_NRO).value) == nro
+            and _fecha_normalizada(ws.cell(row=r, column=COL_FECHA).value) == fecha
+        )
+
+    ultima = _ultima_fila_con_datos(ws)
+    if fila_ref:
+        if not (2 <= fila_ref <= ultima) or not coincide(fila_ref):
+            return []
+        ini = fila_ref
+        while ini - 1 >= 2 and coincide(ini - 1):
+            ini -= 1
+        fin = fila_ref
+        while fin + 1 <= ultima and coincide(fin + 1):
+            fin += 1
+        return list(range(ini, fin + 1))
+    return [r for r in range(2, ultima + 1) if coincide(r)]
+
+
+def buscar_recibo(ruta_recibos, nro_recibo, fecha_emision, fila_ref=None):
+    """
+    Filas de un recibo identificado por N° + fecha de emisión (así no se confunde con
+    el mismo número de otro talonario). Devuelve lista de dicts con 'Nombre', 'Actividad', etc.
+    """
+    if not os.path.exists(ruta_recibos):
+        return []
+    mes = nombre_hoja_mes(fecha_emision)
+    wb = load_workbook(ruta_recibos, data_only=True)
+    if not mes or mes not in wb.sheetnames:
+        return []
+    ws = wb[mes]
+    res = []
+    for r in _filas_del_recibo(ws, nro_recibo, fecha_emision, fila_ref):
+        res.append({col: ws.cell(row=r, column=i).value for i, col in enumerate(COLUMNAS_RECIBOS, start=1)})
+    return res
+
+
+def recibos_con_mismo_numero_en_el_mes(ruta_recibos, nro_recibo, fecha_emision):
+    """Recibos (no cobros de saldo ni carnets) con ese número en la hoja del mes de la fecha dada."""
+    if not os.path.exists(ruta_recibos):
+        return []
+    mes = nombre_hoja_mes(fecha_emision)
+    wb = load_workbook(ruta_recibos, data_only=True)
+    if not mes or mes not in wb.sheetnames:
+        return []
+    ws = wb[mes]
+    nro = _nro_normalizado(nro_recibo)
+    res = []
+    for r in range(2, _ultima_fila_con_datos(ws) + 1):
+        act = str(ws.cell(row=r, column=COL_ACTIVIDAD).value or "")
+        if act in ACTIVIDADES_NO_RECIBO or act.startswith("Carnet"):
+            continue
+        if _nro_normalizado(ws.cell(row=r, column=COL_NRO).value) == nro:
+            res.append({
+                "fecha": _fecha_normalizada(ws.cell(row=r, column=COL_FECHA).value),
+                "nombre": str(ws.cell(row=r, column=COL_NOMBRE).value or ""),
+            })
+    return res
+
+
+def eliminar_recibo(ruta_recibos, nro_recibo, fecha_emision, fila_ref=None):
+    """
+    Elimina las filas del recibo con ese N° y esa fecha de emisión (todas las personas si es grupal).
+    No toca recibos de otros talonarios con el mismo número. Devuelve cuántas filas borró.
+    """
+    mes = nombre_hoja_mes(fecha_emision)
+    wb = load_workbook(ruta_recibos)
+    if not mes or mes not in wb.sheetnames:
+        return 0
+    ws = wb[mes]
+    filas = _filas_del_recibo(ws, nro_recibo, fecha_emision, fila_ref)
+    for r in sorted(filas, reverse=True):
+        ws.delete_rows(r, 1)
+    if filas:
+        _guardar_wb(wb, ruta_recibos)
+    return len(filas)
+
+
+def eliminar_recibo_por_numero(ruta_recibos, nro_recibo, fecha_emision=None):
+    """Compatibilidad: ahora siempre hace falta la fecha para no borrar recibos de otro talonario."""
+    if not fecha_emision:
+        raise ValueError("Para eliminar un recibo hace falta su fecha de emisión.")
+    return eliminar_recibo(ruta_recibos, nro_recibo, fecha_emision) > 0
 
 
 def obtener_recibos_con_deuda(ruta_recibos):
     """
-    Devuelve la lista de registros de recibos.xlsx que tienen saldo pendiente > 0
-    o cuyo estado sea 'Parcial' o 'Debe'.
+    Recibos con saldo pendiente > 0 en TODAS las hojas (incluye las deudas de meses anteriores).
+    Las filas de 'Cobro de Saldo' son solo el registro de un pago y nunca cuentan como deuda.
+    El más reciente primero.
     """
     asegurar_excel_recibos(ruta_recibos)
     if not os.path.exists(ruta_recibos):
         return []
 
     wb = load_workbook(ruta_recibos, data_only=True)
-    ws = wb.active
-
     recibos_deuda = []
-    for r in range(2, ws.max_row + 1):
-        saldo_val = ws.cell(row=r, column=16).value
-        try:
-            saldo_num = float(saldo_val) if saldo_val is not None else 0.0
-        except ValueError:
-            saldo_num = 0.0
-
-        estado_val = str(ws.cell(row=r, column=17).value or "").strip()
-
-        if saldo_num > 0:
-            recibo_info = {
+    for ws in _hojas_ordenadas(wb):
+        for r in range(2, _ultima_fila_con_datos(ws) + 1):
+            if str(ws.cell(row=r, column=COL_ACTIVIDAD).value or "") in ACTIVIDADES_NO_RECIBO:
+                continue
+            saldo_num = _a_numero(ws.cell(row=r, column=COL_SALDO).value)
+            if saldo_num <= 0:
+                continue
+            recibos_deuda.append({
+                "hoja": ws.title,
                 "fila_excel": r,
                 "nro_recibo": ws.cell(row=r, column=1).value,
-                "fecha_emision": str(ws.cell(row=r, column=2).value or ""),
+                "fecha_emision": _fecha_normalizada(ws.cell(row=r, column=2).value),
                 "nombre": str(ws.cell(row=r, column=3).value or ""),
                 "actividad": str(ws.cell(row=r, column=4).value or ""),
                 "clases_sem": ws.cell(row=r, column=6).value,
@@ -415,10 +689,9 @@ def obtener_recibos_con_deuda(ruta_recibos):
                 "total": ws.cell(row=r, column=14).value or 0,
                 "monto_pagado": ws.cell(row=r, column=15).value or 0,
                 "saldo_pendiente": saldo_num,
-                "estado_pago": estado_val,
+                "estado_pago": str(ws.cell(row=r, column=17).value or "").strip(),
                 "observaciones": str(ws.cell(row=r, column=18).value or ""),
-            }
-            recibos_deuda.append(recibo_info)
+            })
 
     recibos_deuda.reverse()
     return recibos_deuda
@@ -434,133 +707,99 @@ def registrar_pago_pendiente(
     observaciones_extra="",
     fila_excel_especifica=None,
     saldar_total=False,
+    hoja=None,
 ):
     """
-    1. Actualiza la/s fila/s original/es del recibo en Excel:
+    1. Actualiza la fila del recibo con deuda (ubicada por hoja + fila; si no se pasan,
+       se busca la deuda más reciente con ese N° y nombre):
        - Mantiene intacto el Monto Pagado del día de emisión.
-       - Descuenta o cancela el Saldo Pendiente (0 si se salda en su totalidad).
-       - Si el saldo queda en 0, cambia el estado a 'Pagado' y QUITA el color rojo/amarillo.
-    2. Agrega una nueva fila al final del Excel con el detalle del abono:
-       Total = total original, Monto Pagado = monto abonado, Saldo = 0 (o restante).
+       - Descuenta el Saldo Pendiente (o lo deja en 0 si se salda en su totalidad).
+       - Si el saldo queda en 0, cambia el estado a 'Pagado' y quita el color en las filas de ESE recibo
+         (mismo N° y misma fecha de emisión; nunca toca otro talonario).
+    2. Agrega una fila 'Cobro de Saldo' en la hoja del mes del pago (saldo 0: es solo el registro del cobro).
+    Todo se guarda de una sola vez.
     """
     asegurar_excel_recibos(ruta_recibos)
     wb = load_workbook(ruta_recibos)
-    ws = wb.active
-
-    fecha_orig = ""
-    venc_orig = ""
     monto_pago_float = float(monto_pago)
-    saldo_restante_a_imputar = monto_pago_float
 
-    filas_a_procesar = []
-    if fila_excel_especifica and 2 <= fila_excel_especifica <= ws.max_row:
-        filas_a_procesar.append(fila_excel_especifica)
+    ws = None
+    fila = None
+    if hoja and hoja in wb.sheetnames and fila_excel_especifica:
+        ws = wb[hoja]
+        fila = fila_excel_especifica
     else:
-        for r in range(2, ws.max_row + 1):
-            val_rec = ws.cell(row=r, column=1).value
-            if val_rec is not None and str(val_rec).strip().lstrip("Rr") == str(nro_recibo).strip().lstrip("Rr"):
-                if not nombre_alumno or str(ws.cell(row=r, column=3).value).strip() == str(nombre_alumno).strip():
-                    filas_a_procesar.append(r)
+        nro_buscado = _nro_normalizado(nro_recibo)
+        for ws_i in reversed(_hojas_ordenadas(wb)):
+            for r in range(_ultima_fila_con_datos(ws_i), 1, -1):
+                if str(ws_i.cell(row=r, column=COL_ACTIVIDAD).value or "") in ACTIVIDADES_NO_RECIBO:
+                    continue
+                if _nro_normalizado(ws_i.cell(row=r, column=COL_NRO).value) != nro_buscado:
+                    continue
+                if nombre_alumno and str(ws_i.cell(row=r, column=COL_NOMBRE).value or "").strip() != str(nombre_alumno).strip():
+                    continue
+                if _a_numero(ws_i.cell(row=r, column=COL_SALDO).value) > 0:
+                    ws, fila = ws_i, r
+                    break
+            if ws:
+                break
+    if ws is None or not (2 <= fila <= ws.max_row):
+        raise ValueError(f"No se encontró el recibo {nro_recibo} con saldo pendiente.")
 
-    total_orig = 0.0
-    val_rec_buscado = str(nro_recibo).strip().lstrip("Rr")
-    for r2 in range(2, ws.max_row + 1):
-        vr = str(ws.cell(row=r2, column=1).value or "").strip().lstrip("Rr")
-        if vr == val_rec_buscado:
-            tot_cell = ws.cell(row=r2, column=14).value
-            try:
-                if tot_cell is not None and str(tot_cell).strip() != "":
-                    t_val = float(tot_cell)
-                    if t_val > total_orig:
-                        total_orig = t_val
-            except ValueError:
-                pass
+    fecha_orig = _fecha_normalizada(ws.cell(row=fila, column=COL_FECHA).value)
+    venc_orig = str(ws.cell(row=fila, column=7).value or "")
+    filas_recibo = _filas_del_recibo(ws, ws.cell(row=fila, column=COL_NRO).value, fecha_orig, fila) or [fila]
 
-    ultimo_nuevo_saldo = 0.0
-    for r in filas_a_procesar:
-        if not fecha_orig:
-            fecha_orig = str(ws.cell(row=r, column=2).value or "")
-        if not venc_orig:
-            venc_orig = str(ws.cell(row=r, column=7).value or "")
+    total_orig = max([_a_numero(ws.cell(row=r, column=COL_TOTAL).value) for r in filas_recibo] + [0.0])
 
-        saldo_actual_val = ws.cell(row=r, column=16).value
-        try:
-            saldo_actual = float(saldo_actual_val) if saldo_actual_val is not None else 0.0
-        except ValueError:
-            saldo_actual = 0.0
+    saldo_actual = _a_numero(ws.cell(row=fila, column=COL_SALDO).value)
+    a_descontar = min(monto_pago_float, saldo_actual)
+    nuevo_saldo = 0.0 if saldar_total else max(0.0, saldo_actual - a_descontar)
 
-        pagado_actual_val = ws.cell(row=r, column=15).value
-        try:
-            pagado_actual = float(pagado_actual_val) if pagado_actual_val is not None else 0.0
-        except ValueError:
-            pagado_actual = 0.0
+    ws.cell(row=fila, column=COL_SALDO, value=nuevo_saldo)
+    if str(ws.cell(row=fila, column=COL_METODO).value or "").strip().lower() in ("no figura", ""):
+        ws.cell(row=fila, column=COL_METODO, value=metodo_pago)
 
-        if saldo_actual > 0 and (saldo_restante_a_imputar > 0 or saldar_total):
-            a_descontar = min(saldo_restante_a_imputar, saldo_actual)
-            nuevo_saldo = 0.0 if saldar_total else (saldo_actual - a_descontar)
-            ultimo_nuevo_saldo = nuevo_saldo
-            saldo_restante_a_imputar = max(0.0, saldo_restante_a_imputar - a_descontar)
+    if nuevo_saldo <= 0:
+        nota = f"[Saldo cancelado {fecha_pago} ({metodo_pago})]"
+        # Recibo grupal: todas las filas de ESTE recibo quedan en Pagado y sin color
+        for r in filas_recibo:
+            ws.cell(row=r, column=COL_ESTADO, value="Pagado")
+            if _a_numero(ws.cell(row=r, column=COL_SALDO).value) > 0:
+                ws.cell(row=r, column=COL_SALDO, value=0)
+            for c in (COL_SALDO, COL_ESTADO):
+                ws.cell(row=r, column=c).fill = PatternFill(fill_type=None)
+                ws.cell(row=r, column=c).font = _FONT_NORMAL
+    else:
+        nota = f"[Abonó {formatear_moneda(a_descontar)} el {fecha_pago} ({metodo_pago}) - Resta {formatear_moneda(nuevo_saldo)}]"
+        fill_amarillo = PatternFill(start_color="FEF08A", end_color="FEF08A", fill_type="solid")
+        font_amarillo = Font(name="Segoe UI", size=10, bold=True, color="854D0E")
+        ws.cell(row=fila, column=COL_ESTADO, value="Parcial")
+        for c in (COL_SALDO, COL_ESTADO):
+            ws.cell(row=fila, column=c).fill = fill_amarillo
+            ws.cell(row=fila, column=c).font = font_amarillo
 
-            # En la fila original, el valor que se pagó el día anterior sigue igual (NO se incrementa)
-            # y se actualiza el saldo pendiente a 0 (o lo que reste)
-            ws.cell(row=r, column=16, value=nuevo_saldo)
+    obs_prev = str(ws.cell(row=fila, column=COL_OBS).value or "").strip()
+    ws.cell(row=fila, column=COL_OBS, value=f"{obs_prev} {nota}".strip())
 
-            # Si el método de pago original era "No figura", actualizarlo al método real abonado
-            if str(ws.cell(row=r, column=10).value or "").strip().lower() in ("no figura", ""):
-                ws.cell(row=r, column=10, value=metodo_pago)
-
-            obs_prev = str(ws.cell(row=r, column=18).value or "").strip()
-
-            c16 = ws.cell(row=r, column=16)
-            c17 = ws.cell(row=r, column=17)
-
-            if nuevo_saldo <= 0:
-                ws.cell(row=r, column=17, value="Pagado")
-                # Quitar el color rojo o amarillo
-                c16.fill = PatternFill(fill_type=None)
-                c16.font = Font(name="Segoe UI", size=10)
-                c17.fill = PatternFill(fill_type=None)
-                c17.font = Font(name="Segoe UI", size=10)
-                nota = f"[Saldo cancelado {fecha_pago} ({metodo_pago})]"
-
-                # Si es un recibo con múltiples filas (grupo familiar), asegurar que todas queden en Pagado sin color
-                for r2 in range(2, ws.max_row + 1):
-                    vr = str(ws.cell(row=r2, column=1).value or "").strip().lstrip("Rr")
-                    if vr == val_rec_buscado:
-                        ws.cell(row=r2, column=17, value="Pagado")
-                        ws.cell(row=r2, column=16).fill = PatternFill(fill_type=None)
-                        ws.cell(row=r2, column=16).font = Font(name="Segoe UI", size=10)
-                        ws.cell(row=r2, column=17).fill = PatternFill(fill_type=None)
-                        ws.cell(row=r2, column=17).font = Font(name="Segoe UI", size=10)
-            else:
-                ws.cell(row=r, column=17, value="Parcial")
-                fill_amarillo = PatternFill(start_color="FEF08A", end_color="FEF08A", fill_type="solid")
-                font_amarillo = Font(name="Segoe UI", size=10, bold=True, color="854D0E")
-                c16.fill = fill_amarillo
-                c16.font = font_amarillo
-                c17.fill = fill_amarillo
-                c17.font = font_amarillo
-                nota = f"[Abonó {formatear_moneda(a_descontar)} el {fecha_pago} ({metodo_pago}) - Resta {formatear_moneda(nuevo_saldo)}]"
-
-            ws.cell(row=r, column=18, value=f"{obs_prev} {nota}".strip())
-
-    wb.save(ruta_recibos)
-
-    # 2. Agregar la fila de registro del pago pendiente
-    det_act = f"Abono saldo R{nro_recibo}"
+    # 2. Fila de registro del cobro (en la hoja del mes del pago)
+    nro_txt = _nro_normalizado(ws.cell(row=fila, column=COL_NRO).value) or _nro_normalizado(nro_recibo)
+    det_act = f"Abono saldo R{nro_txt}"
     if fecha_orig:
         det_act += f" del {fecha_orig}"
 
-    obs_pago = f"Abonó {formatear_moneda(monto_pago_float)} en {metodo_pago}, R{nro_recibo}"
+    obs_pago = f"Abonó {formatear_moneda(monto_pago_float)} en {metodo_pago}, R{nro_txt}"
     if fecha_orig:
         obs_pago += f" del {fecha_orig}"
+    if nuevo_saldo > 0:
+        obs_pago += f" - Resta {formatear_moneda(nuevo_saldo)} (queda en el recibo original)"
     if observaciones_extra:
         obs_pago += f" | {observaciones_extra}"
 
     fila_registro = {
-        "Nro Recibo": f"R{nro_recibo}",
+        "Nro Recibo": f"R{nro_txt}",
         "Fecha Emisión": fecha_pago,
-        "Nombre": nombre_alumno,
+        "Nombre": nombre_alumno or str(ws.cell(row=fila, column=COL_NOMBRE).value or ""),
         "Actividad": "Cobro de Saldo",
         "Detalle Actividad": det_act,
         "Clases por Semana": "",
@@ -573,12 +812,12 @@ def registrar_pago_pendiente(
         "Monto Inscripción": 0,
         "Total": total_orig if total_orig > 0 else monto_pago_float,
         "Monto Pagado": monto_pago_float,
-        "Saldo Pendiente": max(0.0, ultimo_nuevo_saldo),
-        "Estado Pago": "Pagado" if ultimo_nuevo_saldo <= 0 else "Parcial",
+        "Saldo Pendiente": 0,
+        "Estado Pago": "Pagado",
         "Observaciones": obs_pago,
     }
-
-    guardar_fila_recibo(ruta_recibos, fila_registro)
+    _agregar_fila(wb, fila_registro)
+    _guardar_wb(wb, ruta_recibos)
     return True
 
 

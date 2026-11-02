@@ -18,6 +18,8 @@ Los recibos se anotaban en un cuaderno: cuota según las clases por semana, desc
 - **Pagos mixtos** (parte efectivo, parte transferencia), carnets con numeración automática, y registro de carnets entregados sin recibo.
 - **Autocompletado de alumnos** desde la planilla de la pileta: la sincroniza desde un link compartido de OneDrive / SharePoint / Google Sheets (en segundo plano, con caché local para trabajar sin internet) o desde un archivo local. Detecta jubilados y lee los días de clase escritos a mano ("Lu, Mi y Vi 15:30", "martes y jueves 18hs").
 - **Todo queda en Excel** (`recibos.xlsx`), con formato, para que se pueda abrir y revisar sin la app.
+- **Una hoja por mes** ("Octubre 2026", "Noviembre 2026", ...): cada recibo va a la hoja del mes de su fecha de emisión y la hoja del mes nuevo se crea sola. Las deudas de meses anteriores siguen apareciendo en "Cobro de saldo" hasta que se cobran, y el cobro se anota en la hoja del mes en que se pagó.
+- **Copias de seguridad automáticas**: antes del primer cambio de cada día se guarda una copia en `copias_seguridad/` (se conservan las últimas 60), y cada guardado se hace de una sola vez para que el Excel no quede a medio escribir.
 - Numeración de recibos y carnets que respeta cuando se termina un talonario y se vuelve a empezar desde 1.
 
 ## Cómo probarla

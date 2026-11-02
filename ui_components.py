@@ -3,7 +3,7 @@ import calendar
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import date, datetime
-from utils import quitar_tildes, formatear_moneda, parsear_fecha
+from utils import quitar_tildes, formatear_moneda, parsear_fecha, limpiar_monto
 
 
 # ==========================================================
@@ -1020,7 +1020,7 @@ class DialogoPagoPendiente:
         self.var_fecha_pago = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
         self.var_metodo_pago = tk.StringVar(value="Efectivo")
         self.var_monto_pago = tk.StringVar()
-        self.var_saldar_total = tk.BooleanVar(value=True)
+        self.var_saldar_total = tk.BooleanVar(value=False)
         self.var_obs = tk.StringVar()
 
         self._construir_ui(recibo_preseleccionado)
@@ -1050,11 +1050,17 @@ class DialogoPagoPendiente:
 
         opciones_combo = []
         indice_a_elegir = 0
+        if isinstance(preseleccion, (tuple, list)):
+            presel_nro, presel_fecha = str(preseleccion[0]), str(preseleccion[1]).strip()
+        else:
+            presel_nro, presel_fecha = (str(preseleccion) if preseleccion is not None else None), None
         for i, r in enumerate(self.recibos_con_deuda):
-            txt = f"Recibo {r['nro_recibo']} - {r['nombre']} (Saldo: {formatear_moneda(r['saldo_pendiente'])}) - Emisión: {r['fecha_emision']}"
+            txt = f"Recibo {r['nro_recibo']} - {r['nombre']} (Saldo: {formatear_moneda(r['saldo_pendiente'])}) - Emisión: {r['fecha_emision']} [{r.get('hoja', '')}]"
             opciones_combo.append(txt)
-            if preseleccion is not None:
-                if str(r.get("nro_recibo")).strip().lstrip("Rr") == str(preseleccion).strip().lstrip("Rr") or r.get("fila_excel") == preseleccion:
+            if presel_nro is not None:
+                mismo_nro = str(r.get("nro_recibo")).strip().lstrip("Rr") == presel_nro.strip().lstrip("Rr")
+                misma_fecha = presel_fecha is None or str(r.get("fecha_emision", "")).strip() == presel_fecha
+                if mismo_nro and misma_fecha:
                     indice_a_elegir = i
 
         self.combo = ttk.Combobox(
@@ -1132,7 +1138,7 @@ class DialogoPagoPendiente:
         f_saldar.pack(fill=tk.X, pady=(2, 6))
         ttk.Checkbutton(
             f_saldar,
-            text="Marcar deuda del recibo original como totalmente cancelada ($0 saldo pendiente)",
+            text="Perdonar el resto: dejar la deuda en $0 aunque se cobre menos del saldo",
             variable=self.var_saldar_total,
         ).pack(side=tk.LEFT)
 
@@ -1218,7 +1224,7 @@ class DialogoPagoPendiente:
             return
 
         try:
-            limpio_monto = self.var_monto_pago.get().replace("$", "").replace(".", "").replace(",", ".").strip()
+            limpio_monto = limpiar_monto(self.var_monto_pago.get())
             monto_val = float(limpio_monto)
         except ValueError:
             messagebox.showwarning("Monto inválido", "El monto a cobrar ingresado no es válido.", parent=self.dlg)
@@ -1250,6 +1256,7 @@ class DialogoPagoPendiente:
                 metodo_pago=self.var_metodo_pago.get(),
                 observaciones_extra=self.var_obs.get().strip(),
                 fila_excel_especifica=r.get("fila_excel"),
+                hoja=r.get("hoja"),
                 saldar_total=self.var_saldar_total.get(),
             )
         except PermissionError:

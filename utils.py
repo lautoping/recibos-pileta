@@ -57,3 +57,17 @@ def formatear_moneda(valor):
         return f"${num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
         return "$0"
+
+
+def limpiar_monto(texto):
+    """
+    Normaliza un monto escrito a mano a un string que float() entiende.
+    Acepta '$73.000', '73000', '1.234,50', '1234,5' y '1234.50'
+    (un punto seguido de exactamente 3 cifras se toma como separador de miles).
+    """
+    t = str(texto if texto is not None else "").replace("$", "").replace(" ", "").strip()
+    if "," in t:
+        return t.replace(".", "").replace(",", ".")
+    if "." in t and re.fullmatch(r"-?\d{1,3}(\.\d{3})+", t):
+        return t.replace(".", "")
+    return t

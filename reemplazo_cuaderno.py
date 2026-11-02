@@ -16,12 +16,16 @@ from utils import (
     parsear_fecha,
     sumar_un_mes,
     formatear_moneda,
+    limpiar_monto,
 )
 from excel_manager import (
     cargar_tabla_precios,
     obtener_estado_recibos,
-    guardar_fila_recibo,
-    eliminar_recibo_por_numero,
+    guardar_filas_recibo,
+    eliminar_recibo,
+    buscar_recibo,
+    recibos_con_mismo_numero_en_el_mes,
+    nombre_hoja_mes,
 )
 from alumnos_service import (
     cargar_cache_alumnos,
@@ -867,7 +871,7 @@ class ReemplazoCuadernoApp:
         if not str_ef:
             return 0.0
         try:
-            limpio = str_ef.replace("$", "").replace(".", "").replace(",", ".").strip()
+            limpio = limpiar_monto(str_ef)
             return max(0.0, float(limpio))
         except ValueError:
             return 0.0
@@ -877,7 +881,7 @@ class ReemplazoCuadernoApp:
         if not str_val:
             return 0.0
         try:
-            limpio = str_val.replace("$", "").replace(".", "").replace(",", ".").strip()
+            limpio = limpiar_monto(str_val)
             return max(0.0, float(limpio))
         except ValueError:
             return 0.0
@@ -952,7 +956,7 @@ class ReemplazoCuadernoApp:
 
         if self.var_editar_total_manual.get():
             try:
-                limpio = self.var_total_manual.get().replace("$", "").replace(".", "").replace(",", ".").strip()
+                limpio = limpiar_monto(self.var_total_manual.get())
                 total_final = float(limpio)
             except ValueError:
                 total_final = total_calculado
@@ -976,7 +980,14 @@ class ReemplazoCuadernoApp:
         if self.var_metodo_pago.get() == "Mixto" and hasattr(self, "lbl_mixto_info"):
             tipo_m = self.var_tipo_mixto.get()
             monto_p1 = self._obtener_monto_p1_mixto()
-            resto = max(0.0, total_final - monto_p1)
+            base_mixto = total_final
+            if self.var_estado_pago.get() == "Parcial":
+                try:
+                    limpio_b = limpiar_monto(self.var_monto_abonado.get())
+                    base_mixto = min(max(0.0, float(limpio_b)), total_final) if limpio_b else 0.0
+                except ValueError:
+                    base_mixto = 0.0
+            resto = max(0.0, base_mixto - monto_p1)
 
             if tipo_m == "Efectivo + Transferencia":
                 info_tit = ""
@@ -1029,7 +1040,7 @@ class ReemplazoCuadernoApp:
             )
         elif st == "Parcial":
             try:
-                limpio_ab = self.var_monto_abonado.get().replace("$", "").replace(".", "").replace(",", ".").strip()
+                limpio_ab = limpiar_monto(self.var_monto_abonado.get())
                 val_abonado = float(limpio_ab) if limpio_ab else 0.0
             except ValueError:
                 val_abonado = 0.0
@@ -1151,7 +1162,7 @@ class ReemplazoCuadernoApp:
 
         if self.var_editar_total_manual.get():
             try:
-                limpio = self.var_total_manual.get().replace("$", "").replace(".", "").replace(",", ".").strip()
+                limpio = limpiar_monto(self.var_total_manual.get())
                 total_final = float(limpio)
             except ValueError:
                 total_final = total_calculado
@@ -1173,7 +1184,7 @@ class ReemplazoCuadernoApp:
                 self.entry_monto_abonado.focus_set()
                 return
             try:
-                limpio_ab = str_ab.replace("$", "").replace(".", "").replace(",", ".").strip()
+                limpio_ab = limpiar_monto(str_ab)
                 total_abonado = float(limpio_ab)
             except ValueError:
                 messagebox.showwarning("Monto inválido", "El monto abonado ingresado no es válido.")
@@ -1194,7 +1205,9 @@ class ReemplazoCuadernoApp:
         if mp == "Mixto":
             tipo_m = self.var_tipo_mixto.get()
             monto_p1 = self._obtener_monto_p1_mixto()
-            resto_monto = max(0.0, total_final - monto_p1)
+            # En un pago parcial el reparto es sobre lo que realmente se abonó
+            base_mixto = total_abonado if estado_pago == "Parcial" else total_final
+            resto_monto = max(0.0, base_mixto - monto_p1)
             if tipo_m == "Efectivo + Transferencia":
                 metodo_pago_str = f"Mixto ({formatear_moneda(monto_p1)} Efectivo / {formatear_moneda(resto_monto)} Transferencia)"
             elif tipo_m == "Efectivo + Débito":
@@ -1307,8 +1320,22 @@ class ReemplazoCuadernoApp:
             filas_a_guardar.append(fila_datos)
 
         try:
-            for fila in filas_a_guardar:
-                guardar_fila_recibo(self.config["archivo_recibos"], fila)
+            repetidos = recibos_con_mismo_numero_en_el_mes(
+                self.config["archivo_recibos"], nro_recibo, fecha_emision_str
+            )
+        except Exception:
+            repetidos = []
+        if repetidos:
+            detalle_rep = "\n".join(f"  • {r['fecha']} - {r['nombre']}" for r in repetidos[:5])
+            if not messagebox.askyesno(
+                "N° de Recibo repetido",
+                f"Ya hay un Recibo N° {nro_recibo} cargado en {nombre_hoja_mes(fecha_emision_str)}:\n\n"
+                f"{detalle_rep}\n\n¿Guardarlo igual con el mismo número?",
+            ):
+                return
+
+        try:
+            guardar_filas_recibo(self.config["archivo_recibos"], filas_a_guardar)
         except PermissionError:
             messagebox.showerror(
                 "Archivo Excel Abierto",
@@ -1371,8 +1398,11 @@ class ReemplazoCuadernoApp:
     def _refrescar_tabla(self, registros):
         for item in self.tree.get_children():
             self.tree.delete(item)
+        # Para cada fila de la tabla: en qué fila de qué hoja del Excel está
+        self._filas_tabla = {}
 
         for r in registros:
+            fila_ref = r.get("_fila")
             act_mostrar = r.get("Actividad", "")
             if act_mostrar == "Otro" and r.get("Detalle Actividad"):
                 act_mostrar = f"Otro ({r.get('Detalle Actividad')})"
@@ -1419,7 +1449,7 @@ class ReemplazoCuadernoApp:
             else:
                 sal_mostrar = formatear_moneda(monto_sal)
 
-            self.tree.insert(
+            iid = self.tree.insert(
                 "",
                 tk.END,
                 values=(
@@ -1440,6 +1470,7 @@ class ReemplazoCuadernoApp:
                 ),
                 tags=(tag,) if tag else (),
             )
+            self._filas_tabla[iid] = fila_ref
 
     def _eliminar_recibo_seleccionado(self):
         sel = self.tree.selection()
@@ -1448,22 +1479,45 @@ class ReemplazoCuadernoApp:
             return
 
         valores = self.tree.item(sel[0], "values")
-        nro_recibo = valores[0]
-        nombre = valores[2]
+        nro_recibo = str(valores[0]).strip()
+        fecha_emision = str(valores[1]).strip()
+        actividad = str(valores[3]).strip()
+        if not nro_recibo or not fecha_emision:
+            messagebox.showinfo(
+                "No se puede eliminar",
+                "Esta fila no tiene N° de recibo o fecha de emisión. Borrala directamente en el Excel.",
+            )
+            return
 
+        try:
+            fila_ref = getattr(self, "_filas_tabla", {}).get(sel[0])
+            filas = buscar_recibo(self.config["archivo_recibos"], nro_recibo, fecha_emision, fila_ref)
+        except Exception:
+            filas = []
+        if not filas:
+            messagebox.showinfo("No encontrado", f"No se encontró el Recibo N° {nro_recibo} del {fecha_emision}.")
+            return
+
+        lista = "\n".join(f"  • {f.get('Nombre') or ''} ({f.get('Actividad') or ''})" for f in filas)
+        aviso = ""
+        if any(str(f.get("Actividad") or "") == "Cobro de Saldo" for f in filas) or actividad == "Cobro de Saldo":
+            aviso = (
+                "\n\nAtención: esto borra solo el registro del cobro. El recibo original NO vuelve a quedar "
+                "con deuda; si hace falta, corregí el saldo en el Excel."
+            )
         confirmar = messagebox.askyesno(
             "Confirmar Eliminación",
-            f"¿Seguro que querés eliminar el Recibo N° {nro_recibo} (alumno/a '{nombre}') del archivo Excel?\n\n"
-            "Si este recibo incluye más de una persona, se eliminarán todas las filas asociadas a ese N° de recibo.",
+            f"¿Seguro que querés eliminar el Recibo N° {nro_recibo} del {fecha_emision}?\n\n"
+            f"Se van a borrar {len(filas)} fila(s):\n{lista}{aviso}",
         )
         if not confirmar:
             return
 
         try:
-            borrado = eliminar_recibo_por_numero(self.config["archivo_recibos"], nro_recibo)
-            if borrado:
+            borradas = eliminar_recibo(self.config["archivo_recibos"], nro_recibo, fecha_emision, fila_ref)
+            if borradas:
                 self._recargar_todo(inicial=False)
-                messagebox.showinfo("Eliminado", f"El Recibo N° {nro_recibo} fue eliminado correctamente.")
+                messagebox.showinfo("Eliminado", f"El Recibo N° {nro_recibo} del {fecha_emision} fue eliminado ({borradas} fila/s).")
         except PermissionError:
             messagebox.showerror(
                 "Archivo Abierto",
@@ -1485,8 +1539,7 @@ class ReemplazoCuadernoApp:
             self._abrir_dialogo_pago_pendiente()
             return
         valores = self.tree.item(sel[0], "values")
-        nro_recibo = valores[0]
-        self._abrir_dialogo_pago_pendiente(preseleccion=nro_recibo)
+        self._abrir_dialogo_pago_pendiente(preseleccion=(valores[0], valores[1]))
 
     def _abrir_dialogo_carnet_sin_recibo(self):
         precio_carnet = self.precios_data.get("carnet", 1000.0)

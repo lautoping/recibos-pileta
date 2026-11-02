@@ -32,7 +32,7 @@ from config import (
     ARCHIVO_RECIBOS_DEFAULT,
 )
 from utils import sumar_un_mes, quitar_tildes
-from excel_manager import crear_excel_precios_por_defecto, guardar_fila_recibo, cargar_tabla_precios
+from excel_manager import crear_excel_precios_por_defecto, guardar_filas_recibo, cargar_tabla_precios
 from alumnos_service import extraer_datos_alumnos_dataframe, guardar_cache_alumnos
 
 ARCHIVO_ALUMNOS_EJEMPLO = os.path.join(DIR_ACTUAL, "alumnos_ejemplo.xlsx")
@@ -185,8 +185,7 @@ def main():
 
     hoy = date.today()
     desde = hoy - timedelta(days=45)
-    for fila in generar_recibos(rnd, nombres, detalles, precios, desde, hasta=hoy):
-        guardar_fila_recibo(ARCHIVO_RECIBOS_DEFAULT, fila)
+    guardar_filas_recibo(ARCHIVO_RECIBOS_DEFAULT, generar_recibos(rnd, nombres, detalles, precios, desde, hasta=hoy))
 
     with open(ARCHIVO_CONFIG, "w", encoding="utf-8") as f:
         json.dump({

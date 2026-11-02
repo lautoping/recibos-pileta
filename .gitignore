@@ -15,3 +15,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Copias de seguridad automáticas de recibos.xlsx
+copias_seguridad/
