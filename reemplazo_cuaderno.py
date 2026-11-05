@@ -25,12 +25,14 @@ from excel_manager import (
     guardar_filas_recibo,
     eliminar_recibo,
     buscar_recibo,
-    recibos_con_mismo_numero_en_el_mes,
+    recibos_con_mismo_numero_recientes,
+    DIAS_AVISO_REPETIDO,
     nombre_hoja_mes,
     resumen_recibos,
-    buscar_recibo_previo_del_grupo,
+    recibos_del_grupo_para_dto,
     buscar_cda_previa,
     calcular_vto_desde_recibo_anterior,
+    buscar_ultimo_recibo_cuota,
     ACTIVIDADES_SIN_CUOTA,
 )
 from alumnos_service import (
@@ -811,17 +813,21 @@ class ReemplazoCuadernoApp:
         i = self.indice_gf.get(quitar_tildes(nombre or ""))
         return self.grupos_familiares[i] if i is not None else None
 
-    def recibo_gf_previo(self, nombre):
-        """Recibo vigente de otro integrante del grupo familiar del alumno (para el dto. GF), o None."""
+    def recibos_gf_elegibles(self, nombre):
+        """Recibos de otros integrantes del grupo familiar que se pueden elegir para el dto. GF."""
         grupo = self.grupo_de(nombre)
         if not grupo:
-            return None
+            return []
         otros = [m for m in grupo["miembros"] if quitar_tildes(m) != quitar_tildes(nombre)]
-        return buscar_recibo_previo_del_grupo(self.resumen_recibos, otros, self.var_fecha_emision.get())
+        return recibos_del_grupo_para_dto(self.resumen_recibos, nombre, otros, self.var_fecha_emision.get())
 
     def vto_desde_anterior(self, nombre):
         """(vto nuevo, recibo anterior) si el alumno tiene recibo de cuota en el mes anterior."""
         return calcular_vto_desde_recibo_anterior(self.resumen_recibos, nombre, self.var_fecha_emision.get())
+
+    def ultimo_recibo_cuota(self, nombre):
+        """El recibo de cuota más reciente del alumno (para traer método de pago y clases/sem), o None."""
+        return buscar_ultimo_recibo_cuota(self.resumen_recibos, nombre, self.var_fecha_emision.get())
 
     def cda_previa(self, nombre):
         """La CdA más reciente del alumno, o None."""
@@ -899,6 +905,7 @@ class ReemplazoCuadernoApp:
             self._propagar_vencimiento_a_alumnos(venc_str)
             if hasattr(self, "alumnos_items"):
                 self._refrescar_info_gf()
+                self._actualizar_calculo_precio()
 
     def _forzar_vencimiento_un_mes(self):
         dt = parsear_fecha(self.var_fecha_emision.get())
@@ -1016,7 +1023,30 @@ class ReemplazoCuadernoApp:
             self.entry_total_manual.config(state="disabled")
             self._actualizar_calculo_precio()
 
+    def _revisar_atrasos(self):
+        """
+        Marca o desmarca solo 'Fuera de término' según los días de clase de cada alumno.
+        Solo lo cambia cuando cambia el resultado (alumno, vto, fecha), así una corrección
+        a mano se respeta. Si de algún alumno no se saben los días y nadie está atrasado, no lo toca.
+        """
+        items = list(getattr(self, "alumnos_items", []))
+        por_item = [(item, item.estado_atraso()) for item in items]
+        estados = [est for _, est in por_item if est]
+        firma = tuple(estados)
+        if firma != getattr(self, "_atraso_firma", None):
+            self._atraso_firma = firma
+            nuevo = None
+            if any(e[0] == "atrasado" for e in estados):
+                nuevo = True
+            elif not any(e[0] == "sin_dias" for e in estados):
+                nuevo = False
+            if nuevo is not None and self.var_pago_vencido.get() != nuevo:
+                self.var_pago_vencido.set(nuevo)
+        for item, est in por_item:
+            item.mostrar_atraso(est)
+
     def _actualizar_calculo_precio(self, *args):
+        self._revisar_atrasos()
         total_calculado = 0.0
         desglose_parts = []
 
@@ -1419,8 +1449,21 @@ class ReemplazoCuadernoApp:
             }
             filas_a_guardar.append(fila_datos)
 
+        tit = self.alumnos_items[0]
+        if (
+            n_alumnos == 1
+            and tit.var_descuento.get() == "Grupo familiar"
+            and not tit.var_gf_asociado.get().strip()
+            and not messagebox.askyesno(
+                "Dto. Grupo Familiar",
+                "Marcaste descuento Grupo familiar pero no elegiste el recibo del familiar que lo justifica.\n\n"
+                "¿Guardarlo igual sin recibo GF?",
+            )
+        ):
+            return
+
         try:
-            repetidos = recibos_con_mismo_numero_en_el_mes(
+            repetidos = recibos_con_mismo_numero_recientes(
                 self.config["archivo_recibos"], nro_recibo, fecha_emision_str
             )
         except Exception:
@@ -1429,7 +1472,7 @@ class ReemplazoCuadernoApp:
             detalle_rep = "\n".join(f"  • {r['fecha']} - {r['nombre']}" for r in repetidos[:5])
             if not messagebox.askyesno(
                 "N° de Recibo repetido",
-                f"Ya hay un Recibo N° {nro_recibo} cargado en {nombre_hoja_mes(fecha_emision_str)}:\n\n"
+                f"Ya hay un Recibo N° {nro_recibo} cargado en los últimos {DIAS_AVISO_REPETIDO} días:\n\n"
                 f"{detalle_rep}\n\n¿Guardarlo igual con el mismo número?",
             ):
                 return
@@ -1480,6 +1523,7 @@ class ReemplazoCuadernoApp:
         self._al_cambiar_metodo_pago()
 
         self.var_pago_vencido.set(False)
+        self._atraso_firma = None
         self.var_editar_nro_recibo.set(False)
         self._toggle_editar_nro_recibo()
         self.var_editar_total_manual.set(False)

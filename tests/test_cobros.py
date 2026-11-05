@@ -20,7 +20,7 @@ from excel_manager import (
     eliminar_recibo,
     obtener_estado_recibos,
     asegurar_excel_recibos,
-    recibos_con_mismo_numero_en_el_mes,
+    recibos_con_mismo_numero_recientes,
 )
 
 
@@ -96,7 +96,7 @@ class TestHojasPorMes(unittest.TestCase):
 
     def test_deuda_del_mes_pasado_sigue_y_el_cobro_va_al_mes_nuevo(self):
         guardar_fila_recibo(self.ruta, fila(400, "30/10/2026", "Ana", 73000, 0, "Debe"))
-        guardar_fila_recibo(self.ruta, fila(401, "02/11/2026", "Beto", 41000, 41000, "Pagado"))
+        guardar_fila_recibo(self.ruta, fila(41, "02/11/2026", "Beto", 41000, 41000, "Pagado"))
         wb = load_workbook(self.ruta)
         self.assertIn("Octubre 2026", wb.sheetnames)
         self.assertIn("Noviembre 2026", wb.sheetnames)
@@ -110,7 +110,7 @@ class TestHojasPorMes(unittest.TestCase):
         self.assertEqual(obtener_recibos_con_deuda(self.ruta), [])
         ws_nov = load_workbook(self.ruta)["Noviembre 2026"]
         self.assertEqual(ws_nov.cell(row=3, column=4).value, "Cobro de Saldo")
-        self.assertEqual(obtener_estado_recibos(self.ruta)[0], 402)
+        self.assertEqual(obtener_estado_recibos(self.ruta)[0], 42)
 
     def test_hoja_vieja_recibos_se_pasa_a_hojas_mensuales(self):
         wb = Workbook()
@@ -130,10 +130,23 @@ class TestHojasPorMes(unittest.TestCase):
         copias = os.listdir(os.path.join(self.tmp.name, "copias_seguridad"))
         self.assertEqual(len(copias), 1)
 
-    def test_aviso_de_numero_repetido_en_el_mes(self):
+    def test_aviso_de_numero_repetido_solo_si_es_reciente(self):
         guardar_fila_recibo(self.ruta, fila(242, "29/10/2026", "Ana", 66000, 66000, "Pagado"))
-        self.assertEqual(len(recibos_con_mismo_numero_en_el_mes(self.ruta, 242, "30/10/2026")), 1)
-        self.assertEqual(recibos_con_mismo_numero_en_el_mes(self.ruta, 242, "01/11/2026"), [])
+        # Repetido al día siguiente (aunque cambie el mes): es un error, avisa
+        self.assertEqual(len(recibos_con_mismo_numero_recientes(self.ruta, 242, "30/10/2026")), 1)
+        self.assertEqual(len(recibos_con_mismo_numero_recientes(self.ruta, 242, "01/11/2026")), 1)
+        # Otra vuelta del talonario en el mismo mes (semanas después): no avisa
+        guardar_fila_recibo(self.ruta, fila(15, "02/10/2026", "Beto", 66000, 66000, "Pagado"))
+        self.assertEqual(recibos_con_mismo_numero_recientes(self.ruta, 15, "28/10/2026"), [])
+        self.assertEqual(recibos_con_mismo_numero_recientes(self.ruta, 242, "25/11/2026"), [])
+
+    def test_despues_del_400_vuelve_al_1(self):
+        guardar_fila_recibo(self.ruta, fila(399, "07/10/2026", "Ana", 66000, 66000, "Pagado"))
+        self.assertEqual(obtener_estado_recibos(self.ruta)[0], 400)
+        guardar_fila_recibo(self.ruta, fila(400, "07/10/2026", "Beto", 66000, 66000, "Pagado"))
+        self.assertEqual(obtener_estado_recibos(self.ruta)[0], 1)
+        guardar_fila_recibo(self.ruta, fila(1, "07/10/2026", "Carla", 66000, 66000, "Pagado"))
+        self.assertEqual(obtener_estado_recibos(self.ruta)[0], 2)
 
 
 class TestMontos(unittest.TestCase):

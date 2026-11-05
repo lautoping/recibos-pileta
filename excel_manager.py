@@ -193,6 +193,11 @@ COL_METODO, COL_TOTAL, COL_PAGADO, COL_SALDO, COL_ESTADO, COL_OBS = 10, 14, 15, 
 
 ACTIVIDADES_NO_RECIBO = ("Cobro de Saldo",)
 
+# Los talonarios van del 1 al 400: después del 400 se vuelve a empezar desde el 1.
+TOPE_RECIBO = 400
+# Un mismo N° de recibo emitido dentro de estos días es un error (una vuelta de talonario tarda mucho más).
+DIAS_AVISO_REPETIDO = 10
+
 _BORDE = Border(
     bottom=Side(style="thin", color="E2E8F0"),
     left=Side(style="thin", color="E2E8F0"),
@@ -483,6 +488,8 @@ def obtener_estado_recibos(ruta_recibos):
         m = re.match(r"^\s*[Rr]?\s*(\d+)", _nro_normalizado(f.get("Nro Recibo")))
         if m:
             proximo_recibo = int(m.group(1)) + 1
+            if proximo_recibo > TOPE_RECIBO:
+                proximo_recibo = 1
             break
 
     proximo_carnet = 1
@@ -607,27 +614,45 @@ def buscar_recibo(ruta_recibos, nro_recibo, fecha_emision, fila_ref=None):
     return res
 
 
-def recibos_con_mismo_numero_en_el_mes(ruta_recibos, nro_recibo, fecha_emision):
-    """Recibos (no cobros de saldo ni carnets) con ese número en la hoja del mes de la fecha dada."""
+def recibos_con_mismo_numero_recientes(ruta_recibos, nro_recibo, fecha_emision, dias=DIAS_AVISO_REPETIDO):
+    """
+    Recibos (no cobros de saldo ni carnets) con ese número emitidos hasta `dias` días antes o después
+    de la fecha dada, en cualquier hoja. Como el talonario se reinicia después del 400, el mismo número
+    puede aparecer legítimamente en el mes; solo es un error si se repite en pocos días.
+    """
     if not os.path.exists(ruta_recibos):
         return []
-    mes = nombre_hoja_mes(fecha_emision)
-    wb = load_workbook(ruta_recibos, data_only=True)
-    if not mes or mes not in wb.sheetnames:
+    dt_ref = parsear_fecha(fecha_emision) if fecha_emision else None
+    if not dt_ref:
         return []
-    ws = wb[mes]
+    wb = load_workbook(ruta_recibos, data_only=True)
     nro = _nro_normalizado(nro_recibo)
     res = []
-    for r in range(2, _ultima_fila_con_datos(ws) + 1):
-        act = str(ws.cell(row=r, column=COL_ACTIVIDAD).value or "")
-        if act in ACTIVIDADES_NO_RECIBO or act.startswith("Carnet"):
-            continue
-        if _nro_normalizado(ws.cell(row=r, column=COL_NRO).value) == nro:
+    for ws in _hojas_ordenadas(wb):
+        for r in range(2, _ultima_fila_con_datos(ws) + 1):
+            act = str(ws.cell(row=r, column=COL_ACTIVIDAD).value or "")
+            if act in ACTIVIDADES_NO_RECIBO or act.startswith("Carnet"):
+                continue
+            if _nro_normalizado(ws.cell(row=r, column=COL_NRO).value) != nro:
+                continue
+            valor_fecha = ws.cell(row=r, column=COL_FECHA).value
+            if isinstance(valor_fecha, datetime):
+                dt = valor_fecha.date()
+            elif isinstance(valor_fecha, date):
+                dt = valor_fecha
+            else:
+                dt = parsear_fecha(valor_fecha) if valor_fecha not in (None, "") else None
+            if not dt or abs((dt - dt_ref).days) > dias:
+                continue
             res.append({
-                "fecha": _fecha_normalizada(ws.cell(row=r, column=COL_FECHA).value),
+                "fecha": _fecha_normalizada(valor_fecha),
                 "nombre": str(ws.cell(row=r, column=COL_NOMBRE).value or ""),
             })
     return res
+
+
+# Nombre anterior (compatibilidad): ahora avisa solo si el número se repite en pocos días.
+recibos_con_mismo_numero_en_el_mes = recibos_con_mismo_numero_recientes
 
 
 def eliminar_recibo(ruta_recibos, nro_recibo, fecha_emision, fila_ref=None):
@@ -675,6 +700,9 @@ def resumen_recibos(ruta_recibos):
                 "nombre": str(fila[COL_NOMBRE - 1]).strip(),
                 "actividad": str(fila[COL_ACTIVIDAD - 1] or ""),
                 "vto": _fecha_normalizada(fila[6]) if fila[6] not in (None, "") else "",
+                "detalle_actividad": str(fila[4] or "").strip(),
+                "clases_sem": fila[5],
+                "metodo_pago": str(fila[COL_METODO - 1] or "").strip(),
             })
     wb.close()
     return res
@@ -704,58 +732,117 @@ def buscar_cda_previa(resumen, nombre, fecha_emision):
 
 def calcular_vto_desde_recibo_anterior(resumen, nombre, fecha_emision):
     """
-    Si el alumno tiene un recibo de cuota emitido en el mes anterior al de fecha_emision,
-    devuelve (nuevo_vto 'dd/mm/aaaa', recibo_anterior): el vencimiento anterior + 1 mes.
-    Si no hay recibo en el mes anterior (o no tenía vencimiento), devuelve (None, None).
+    Toma el último recibo de cuota del alumno (de cualquier mes) y devuelve
+    (nuevo_vto 'dd/mm/aaaa', recibo_anterior) con nuevo_vto = vto anterior + 1 mes,
+    siempre que ese nuevo vto no haya pasado ya a la fecha de emisión (si pasó, el alumno
+    se salteó un período y se usa el vto general).
+    - (None, None): no hay recibo anterior.
+    - (None, recibo): el recibo anterior no tiene vto, o el nuevo vto ya habría pasado.
     """
     dt_actual = parsear_fecha(fecha_emision) if fecha_emision else None
     if not dt_actual:
         return None, None
-    mes_ant = (dt_actual.year, dt_actual.month - 1) if dt_actual.month > 1 else (dt_actual.year - 1, 12)
+    ant = buscar_ultimo_recibo_cuota(resumen, nombre, fecha_emision)
+    if not ant:
+        return None, None
+    vto_ant = parsear_fecha(ant.get("vto", "")) if ant.get("vto") else None
+    if not vto_ant:
+        return None, ant
+    nuevo = sumar_un_mes(vto_ant)
+    if nuevo < dt_actual:
+        return None, ant
+    return nuevo.strftime("%d/%m/%Y"), ant
+
+
+def buscar_ultimo_recibo_cuota(resumen, nombre, fecha_emision):
+    """El recibo de cuota más reciente del alumno emitido hasta la fecha dada, o None."""
+    dt_actual = parsear_fecha(fecha_emision) if fecha_emision else None
     mejor = None
     for r in resumen:
         if r["actividad"] in ACTIVIDADES_SIN_CUOTA or r["actividad"].startswith("Carnet") or not _es_de(r, nombre):
             continue
         dt = parsear_fecha(r["fecha"])
-        if not dt or (dt.year, dt.month) != mes_ant:
+        if not dt or (dt_actual and dt > dt_actual):
             continue
         if mejor is None or dt >= mejor[0]:
             mejor = (dt, r)
-    if not mejor:
-        return None, None
-    vto_ant = parsear_fecha(mejor[1].get("vto", "")) if mejor[1].get("vto") else None
-    if not vto_ant:
-        return None, mejor[1]
-    return sumar_un_mes(vto_ant).strftime("%d/%m/%Y"), mejor[1]
+    return mejor[1] if mejor else None
 
 
-def buscar_recibo_previo_del_grupo(resumen, otros_miembros, fecha_emision):
+def clases_de_recibo(recibo):
+    """Clases por semana (1, 2 o 3) de un recibo, o None si no figura."""
+    try:
+        n = int(float(str((recibo or {}).get("clases_sem") or "").strip().replace(",", ".")))
+    except ValueError:
+        return None
+    return n if n in (1, 2, 3) else None
+
+
+def metodo_de_recibo(recibo):
     """
-    Busca el recibo más reciente de otro integrante del grupo familiar que esté vigente
-    para la fecha de emisión dada (emitido como mucho un mes antes). None si no hay.
+    (método, tipo_mixto) de un recibo: ('Transferencia', None), ('Mixto', 'Efectivo + Débito'), etc.
+    (None, None) si no figura o no se reconoce.
+    """
+    txt = quitar_tildes(str((recibo or {}).get("metodo_pago") or "")).lower()
+    if not txt or "no figura" in txt:
+        return None, None
+    if txt.startswith("mixto"):
+        ef, tr, de = "efectivo" in txt, "transferencia" in txt, "debito" in txt
+        if ef and de:
+            return "Mixto", "Efectivo + Débito"
+        if tr and de and not ef:
+            return "Mixto", "Transferencia + Débito"
+        return "Mixto", "Efectivo + Transferencia"
+    for m in ("Transferencia", "Débito", "Efectivo"):
+        if quitar_tildes(m).lower() in txt:
+            return m, None
+    return None, None
+
+
+def recibos_del_grupo_para_dto(resumen, nombre, otros_miembros, fecha_emision, meses=3):
+    """
+    Recibos de cuota de otros integrantes del grupo familiar que se pueden elegir a mano para
+    justificar el dto. GF: emitidos hasta la fecha de emisión y como mucho `meses` meses antes.
+    Se descartan los recibos donde el propio alumno también figura (ese recibo ya lo incluía).
+    El más reciente primero.
     """
     dt_actual = parsear_fecha(fecha_emision) if fecha_emision else None
     if not dt_actual or not otros_miembros:
-        return None
-    buscados = {quitar_tildes(m) for m in otros_miembros}
-    mejor = None
+        return []
+    buscados = {quitar_tildes(" ".join(str(m).split())) for m in otros_miembros}
+    propios = {(r["nro"], r["fecha"]) for r in resumen if _es_de(r, nombre)}
+    vistos = set()
+    res = []
     for r in resumen:
-        if r["actividad"] in ACTIVIDADES_NO_RECIBO or r["actividad"].startswith("Carnet"):
+        if r["actividad"] in ACTIVIDADES_SIN_CUOTA or r["actividad"].startswith("Carnet"):
             continue
-        if r["actividad"] in ("Solo Inscripción", "Clase Adaptación (CdA)"):
+        if quitar_tildes(" ".join(r["nombre"].split())) not in buscados or not r["nro"]:
             continue
-        if quitar_tildes(r["nombre"]) not in buscados or not r["nro"]:
+        if (r["nro"], r["fecha"]) in propios:
             continue
         dt = parsear_fecha(r["fecha"])
         if not dt or dt > dt_actual:
             continue
-        if dt_actual > sumar_un_mes(dt):
+        limite = dt
+        for _ in range(meses):
+            limite = sumar_un_mes(limite)
+        if dt_actual > limite:
             continue
-        if mejor is None or dt >= mejor["_dt"]:
-            mejor = dict(r, _dt=dt)
-    if mejor:
-        mejor.pop("_dt", None)
-    return mejor
+        clave = (r["nro"], r["fecha"])  # un recibo de grupo aparece una sola vez
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        res.append(dict(r, _dt=dt))
+    res.sort(key=lambda x: x["_dt"], reverse=True)
+    for r in res:
+        r.pop("_dt", None)
+    return res
+
+
+def texto_recibo_gf(recibo):
+    """Texto para Observaciones: 'GF Fulano R328 del 02/10'."""
+    f = recibo.get("fecha", "")
+    return f"GF {recibo['nombre']} R{recibo['nro']} del {f[:5] if len(f) >= 5 else f}"
 
 
 def obtener_recibos_con_deuda(ruta_recibos):

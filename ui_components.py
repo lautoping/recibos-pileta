@@ -3,7 +3,8 @@ import calendar
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import date, datetime
-from utils import quitar_tildes, formatear_moneda, parsear_fecha, limpiar_monto
+from utils import quitar_tildes, formatear_moneda, parsear_fecha, limpiar_monto, revisar_atraso, NOMBRE_DIA_CORTO
+from excel_manager import clases_de_recibo, metodo_de_recibo, texto_recibo_gf
 
 
 # ==========================================================
@@ -427,6 +428,8 @@ class AlumnoItem:
         self.var_cobrar_carnet = tk.BooleanVar(value=False)
         self._vto_auto = None        # vto puesto por la app (vto del recibo anterior + 1 mes)
         self._insc_cda_auto = False  # inscripción "CdA" puesta por la app
+        self._previos_nombre = None  # alumno para el que ya se trajeron método de pago y clases/sem
+        self._previos_txt = ""       # texto que explica de qué recibo se trajeron
         self._actualizando_previos = False
         self.lbl_previos = None
         self.var_actividad = tk.StringVar(value="Natación")
@@ -454,10 +457,9 @@ class AlumnoItem:
         self.entry_venc = None
         self.entry_actividad_otro = None
         self.f_gf_asociado = None
-        self.entry_gf_asociado = None
         self.f_gf_info = None
-        self._gf_auto_clave = None   # (nombre, fecha) para la que ya se aplicó el dto. GF automático
-        self._gf_auto_texto = ""     # texto que puso la app en "Familiar / Recibo GF"
+        self.combo_gf_asociado = None
+        self.lbl_gf_asociado_aviso = None
 
         self._construir_ui()
         self._vincular_trazas()
@@ -483,6 +485,10 @@ class AlumnoItem:
         self.lbl_dias_clase = ttk.Label(f_nom, text="", font=("Segoe UI", 8, "italic"), foreground="#0284c7")
         self.lbl_dias_clase.pack(anchor=tk.W, pady=(2, 0))
 
+        # Pago atrasado (clase después del vto sin haber pagado): sin dto.
+        self.lbl_atraso = ttk.Label(f_nom, text="", font=("Segoe UI", 8, "bold"), foreground="#b91c1c")
+        self.lbl_atraso.pack(anchor=tk.W)
+
         # Vencimiento calculado desde el recibo anterior y CdA previa
         self.lbl_previos = ttk.Label(f_nom, text="", font=("Segoe UI", 8), foreground="#0f766e")
         self.lbl_previos.pack(anchor=tk.W)
@@ -493,7 +499,7 @@ class AlumnoItem:
 
         # Vencimiento individual por alumno
         self.f_venc = ttk.Frame(f1)
-        self.f_venc.pack(side=tk.LEFT, padx=(0, 10))
+        self.f_venc.pack(side=tk.LEFT, anchor=tk.N, padx=(0, 10))
         ttk.Label(self.f_venc, text="Vencimiento:", style="Field.TLabel").pack(anchor=tk.W)
         f_ven_in = ttk.Frame(self.f_venc)
         f_ven_in.pack(anchor=tk.W, pady=(2, 0))
@@ -515,7 +521,7 @@ class AlumnoItem:
         self.btn_cal_venc.pack(side=tk.LEFT)
 
         f_car = ttk.Frame(f1)
-        f_car.pack(side=tk.LEFT, padx=(0, 10))
+        f_car.pack(side=tk.LEFT, anchor=tk.N, padx=(0, 10))
         ttk.Label(f_car, text="Carnet (Opcional):", style="Field.TLabel").pack(anchor=tk.W)
         f_car_in = ttk.Frame(f_car)
         f_car_in.pack(anchor=tk.W, pady=(2, 0))
@@ -546,7 +552,7 @@ class AlumnoItem:
 
         if not self.es_titular:
             f_btn_del = ttk.Frame(f1)
-            f_btn_del.pack(side=tk.RIGHT, pady=(12, 0))
+            f_btn_del.pack(side=tk.RIGHT, anchor=tk.N, pady=(18, 0))
             ttk.Button(
                 f_btn_del,
                 text="❌ Quitar",
@@ -628,13 +634,17 @@ class AlumnoItem:
 
         # Detalle de familiar para quien paga solo con descuento de Grupo Familiar
         self.f_gf_asociado = ttk.Frame(f3)
-        ttk.Label(self.f_gf_asociado, text="Familiar / Recibo GF:", font=("Segoe UI", 9, "bold"), foreground="#1e40af").pack(
-            side=tk.LEFT, padx=(8, 4)
+        # Se elige a mano entre los recibos de otros integrantes de su grupo familiar.
+        ttk.Label(self.f_gf_asociado, text="Recibo GF que justifica el dto.:", font=("Segoe UI", 9, "bold"), foreground="#1e40af").pack(
+            anchor=tk.W
         )
-        self.entry_gf_asociado = ttk.Entry(
-            self.f_gf_asociado, textvariable=self.var_gf_asociado, width=22, font=("Segoe UI", 9)
+        self.combo_gf_asociado = ttk.Combobox(
+            self.f_gf_asociado, textvariable=self.var_gf_asociado, width=34, font=("Segoe UI", 9), state="readonly"
         )
-        self.entry_gf_asociado.pack(side=tk.LEFT)
+        self.combo_gf_asociado.pack(anchor=tk.W, pady=(2, 0))
+        self.combo_gf_asociado.bind("<Button-1>", lambda e: self.actualizar_opciones_gf_asociado(), add="+")
+        self.lbl_gf_asociado_aviso = ttk.Label(self.f_gf_asociado, text="", font=("Segoe UI", 8), foreground="#b45309")
+        self.lbl_gf_asociado_aviso.pack(anchor=tk.W)
 
         # --- Fila 4: Subtotal individual del alumno ---
         f4 = ttk.Frame(self.frame)
@@ -698,15 +708,11 @@ class AlumnoItem:
             self.app._refrescar_info_gf()
         self.app._actualizar_calculo_precio()
 
-    def _descuento_por_defecto(self):
-        mp = self.app.var_metodo_pago.get() if hasattr(self.app, "var_metodo_pago") else ""
-        return "Efectivo" if mp == "Efectivo" else "Ninguno"
-
     def actualizar_info_gf(self):
         """
         Muestra el grupo familiar del alumno según la 2da hoja de la planilla:
-        - Titular: los otros integrantes con un botón para sumarlos al recibo. Si paga solo y otro
-          integrante ya tiene un recibo vigente, aplica el dto. GF y completa 'GF Fulano RXX del dd/mm'.
+        - Titular: los otros integrantes con un botón para sumarlos al recibo. El dto. GF de
+          quien paga solo NO se aplica solo: se marca "Grupo familiar" y se elige a mano el recibo.
         - Resto: avisa si no figura en el mismo grupo que el titular.
         """
         if not self.f_gf_info or not hasattr(self.app, "grupo_de"):
@@ -717,15 +723,6 @@ class AlumnoItem:
         nom = self.var_nombre.get().strip()
         items = getattr(self.app, "alumnos_items", [])
         estilo = {"font": ("Segoe UI", 8), "foreground": "#7c3aed"}
-
-        def revertir_auto():
-            if self._gf_auto_clave is not None:
-                if self.var_gf_asociado.get() == self._gf_auto_texto:
-                    self.var_gf_asociado.set("")
-                if self.var_descuento.get() == "Grupo familiar":
-                    self.var_descuento.set(self._descuento_por_defecto())
-            self._gf_auto_clave = None
-            self._gf_auto_texto = ""
 
         grupo = self.app.grupo_de(nom) if nom else None
 
@@ -746,14 +743,13 @@ class AlumnoItem:
                     ttk.Label(self.f_gf_info, text="👪 Mismo grupo familiar que el titular", **estilo).pack(anchor=tk.W)
             return
 
+        self.actualizar_opciones_gf_asociado()
+
         if not grupo:
-            revertir_auto()
             return
 
         otros = [m for m in grupo["miembros"] if quitar_tildes(m) != quitar_tildes(nom)]
         en_recibo = {quitar_tildes(it.var_nombre.get().strip()) for it in items}
-        solo = len(items) <= 1
-        previo = self.app.recibo_gf_previo(nom) if solo else None
 
         ttk.Label(self.f_gf_info, text=f"👪 Grupo familiar: {', '.join(otros) or '(sin otros integrantes)'}", **estilo).pack(anchor=tk.W)
 
@@ -762,45 +758,33 @@ class AlumnoItem:
         for m in otros:
             if quitar_tildes(m) in en_recibo:
                 continue
-            if previo and quitar_tildes(previo["nombre"]) == quitar_tildes(m):
-                continue  # ya pagó este mes: no se suma al recibo
             ttk.Button(f_btns, text=f"+ {m}", command=lambda m=m: self.app.agregar_miembro_gf(m)).pack(side=tk.LEFT, padx=(0, 4), pady=(1, 0))
 
-        if not solo:
+    def actualizar_opciones_gf_asociado(self):
+        """Carga en la lista los recibos de otros integrantes del grupo familiar (más reciente primero)."""
+        if not self.combo_gf_asociado:
             return
-
-        clave = (quitar_tildes(nom), getattr(self.app, "var_fecha_emision", tk.StringVar()).get())
-        if previo:
-            fecha_corta = previo["fecha"][:5] if len(previo["fecha"]) >= 5 else previo["fecha"]
-            texto_gf = f"GF {previo['nombre']} R{previo['nro']} del {fecha_corta}"
-            if self.var_descuento.get() == "Jubilado":
-                ttk.Label(
-                    self.f_gf_info,
-                    text=f"ℹ️ {previo['nombre']} ya pagó (R{previo['nro']} del {previo['fecha']}). Tiene dto. Jubilado; si corresponde GF, marcalo a mano.",
-                    **estilo,
-                ).pack(anchor=tk.W)
+        nom = self.var_nombre.get().strip()
+        recibos = self.app.recibos_gf_elegibles(nom) if nom and hasattr(self.app, "recibos_gf_elegibles") else []
+        opciones = [texto_recibo_gf(r) for r in recibos]
+        self.combo_gf_asociado.config(values=opciones)
+        actual = self.var_gf_asociado.get().strip()
+        if actual and actual not in opciones:
+            self.var_gf_asociado.set("")
+        if self.lbl_gf_asociado_aviso:
+            if not nom:
+                aviso = ""
+            elif not (hasattr(self.app, "grupo_de") and self.app.grupo_de(nom)):
+                aviso = "No figura en ningún grupo familiar de la planilla."
+            elif not opciones:
+                aviso = "Ningún otro integrante tiene recibos en los últimos 3 meses."
             else:
-                if self._gf_auto_clave != clave:
-                    self._gf_auto_clave = clave
-                    self._gf_auto_texto = texto_gf
-                    self.var_descuento.set("Grupo familiar")
-                    self.var_gf_asociado.set(texto_gf)
-                ttk.Label(
-                    self.f_gf_info,
-                    text=f"✅ Dto. GF: {previo['nombre']} ya pagó el R{previo['nro']} del {previo['fecha']}",
-                    font=("Segoe UI", 8, "bold"),
-                    foreground="#15803d",
-                ).pack(anchor=tk.W)
-        else:
-            if self._gf_auto_clave is not None and self._gf_auto_clave != clave:
-                revertir_auto()
-            ttk.Label(
-                self.f_gf_info,
-                text="Ningún otro integrante tiene un recibo vigente: sin dto. GF si paga solo.",
-                **estilo,
-            ).pack(anchor=tk.W)
+                aviso = ""
+            self.lbl_gf_asociado_aviso.config(text=aviso)
 
     def _al_cambiar_descuento(self, *args):
+        if self.var_descuento.get() != "Grupo familiar" and self.var_gf_asociado.get():
+            self.var_gf_asociado.set("")
         self._actualizar_visibilidad_gf_asociado()
         self.app._actualizar_calculo_precio()
 
@@ -844,7 +828,8 @@ class AlumnoItem:
     def actualizar_datos_previos(self):
         """
         Según los recibos anteriores del alumno:
-        - Vencimiento = vto del recibo del mes anterior + 1 mes (si existe ese recibo).
+        - Vencimiento = vto del último recibo de cuota + 1 mes (si ese vto nuevo todavía no pasó).
+        - Actividad, clases/sem y método de pago (titular) = los del último recibo de cuota.
         - Si tiene una CdA y todavía no pagó una cuota después, marca inscripción 'CdA' ($0).
         """
         if self._actualizando_previos or not self.lbl_previos or not hasattr(self.app, "vto_desde_anterior"):
@@ -872,8 +857,49 @@ class AlumnoItem:
                 if self._vto_auto and actual == self._vto_auto and act != "Clase Adaptación (CdA)":
                     self.var_fecha_vencimiento.set(general)
                 self._vto_auto = None
-                if ant:
+                if ant and ant.get("vto"):
+                    textos.append(
+                        f"📅 Último recibo R{ant['nro']} del {ant['fecha'][:5]} vencía el {ant['vto'][:5]}: "
+                        f"se salteó un mes, se usa el vto general"
+                    )
+                elif ant:
                     textos.append(f"📅 El recibo anterior (R{ant['nro']} del {ant['fecha'][:5]}) no tiene vto: se usa el general")
+
+            # --- Método de pago y clases/sem del último recibo (una sola vez por alumno; después se cambian a mano) ---
+            clave = quitar_tildes(nom)
+            if not clave:
+                self._previos_nombre, self._previos_txt = None, ""
+            elif clave != self._previos_nombre and act not in ("Clase Adaptación (CdA)", "Solo Inscripción") \
+                    and hasattr(self.app, "ultimo_recibo_cuota"):
+                self._previos_nombre, self._previos_txt = clave, ""
+                ult = self.app.ultimo_recibo_cuota(nom)
+                if ult:
+                    partes = []
+                    act_ant = ult.get("actividad", "")
+                    if act_ant in ("Natación", "Aquagym", "Otro"):
+                        if act_ant != act:
+                            self.var_actividad.set(act_ant)
+                        self._al_cambiar_actividad()
+                        if act_ant == "Otro":
+                            self.var_actividad_otro.set(ult.get("detalle_actividad", ""))
+                            self.autocomplete.focus_set()  # que no salte el cursor al campo "Otro"
+                        det = ult.get("detalle_actividad", "") if act_ant == "Otro" else ""
+                        partes.append(f"{act_ant} ({det})" if det else act_ant)
+                    clases = clases_de_recibo(ult)
+                    if clases:
+                        self.var_clases_sem.set(clases)
+                        partes.append(f"{clases} clase{'s' if clases > 1 else ''}/sem")
+                    if self.es_titular and hasattr(self.app, "var_metodo_pago"):
+                        metodo, tipo_mixto = metodo_de_recibo(ult)
+                        if metodo:
+                            if tipo_mixto and hasattr(self.app, "var_tipo_mixto"):
+                                self.app.var_tipo_mixto.set(tipo_mixto)
+                            self.app.var_metodo_pago.set(metodo)
+                            partes.append(f"{metodo} ({tipo_mixto})" if tipo_mixto else metodo)
+                    if partes:
+                        self._previos_txt = f"🔁 Del R{ult['nro']} del {ult['fecha'][:5]}: " + ", ".join(partes)
+            if self._previos_txt and clave == self._previos_nombre:
+                textos.append(self._previos_txt)
 
             # --- CdA previa ---
             cda = self.app.cda_previa(nom) if nom and act != "Clase Adaptación (CdA)" else None
@@ -1032,6 +1058,45 @@ class AlumnoItem:
 
         subtotal = monto_cuota + monto_insc
         return monto_cuota, monto_insc, subtotal
+
+    def estado_atraso(self):
+        """
+        (estado, clase) según revisar_atraso para este alumno, con su vto, sus días de clase
+        y la fecha de emisión como fecha de pago. None si no corresponde revisar (sin nombre,
+        CdA, Solo Inscripción).
+        """
+        nom = self.var_nombre.get().strip()
+        if not nom or self.var_actividad.get() in ("Clase Adaptación (CdA)", "Solo Inscripción"):
+            return None
+        detalles = getattr(self.app, "detalles_alumnos", {}) or {}
+        det = detalles.get(quitar_tildes(" ".join(nom.split()))) or detalles.get(nom) or {}
+        fecha_pago = self.app.var_fecha_emision.get() if hasattr(self.app, "var_fecha_emision") else ""
+        return revisar_atraso(self.var_fecha_vencimiento.get().strip(), fecha_pago, det.get("dias_clase", ""))
+
+    def mostrar_atraso(self, estado):
+        """Muestra debajo de los días de clase si el pago es atrasado."""
+        if not getattr(self, "lbl_atraso", None):
+            return
+        vto = self.var_fecha_vencimiento.get().strip()[:5]
+        if not estado:
+            txt, color = "", "#b91c1c"
+        elif estado[0] == "atrasado":
+            d = estado[1]
+            txt = f"⏰ Atrasado: venció el {vto} y tuvo clase el {NOMBRE_DIA_CORTO[d.weekday()]} {d.strftime('%d/%m')} sin pagar → sin dto."
+            color = "#b91c1c"
+            if hasattr(self.app, "var_pago_vencido") and not self.app.var_pago_vencido.get():
+                txt += " (desmarcado a mano: se cobra con dto.)"
+                color = "#b45309"
+        elif estado[0] == "sin_dias":
+            txt = f"⚠ Venció el {vto} y no se conocen sus días de clase: revisar a mano si es fuera de término"
+            color = "#b45309"
+        elif estado[0] == "en_termino" and (parsear_fecha(self.app.var_fecha_emision.get()) or date.min) \
+                > (parsear_fecha(self.var_fecha_vencimiento.get().strip()) or date.max):
+            txt = f"✅ Venció el {vto} pero no tuvo clase desde entonces: en término"
+            color = "#15803d"
+        else:
+            txt, color = "", "#b91c1c"
+        self.lbl_atraso.config(text=txt, foreground=color)
 
     def actualizar_etiqueta_subtotal(self):
         cuota, insc, subtotal = self.obtener_montos()

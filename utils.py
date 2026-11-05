@@ -1,7 +1,7 @@
 import re
 import calendar
 import unicodedata
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 
 def quitar_tildes(texto):
@@ -46,6 +46,52 @@ def parsear_fecha(texto_fecha):
         except ValueError:
             continue
     return None
+
+
+DIAS_SEMANA = {
+    "lunes": 0, "martes": 1, "miercoles": 2, "jueves": 3, "viernes": 4, "sabado": 5, "domingo": 6,
+}
+NOMBRE_DIA_CORTO = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
+
+
+def dias_semana_de_texto(dias_clase):
+    """
+    'Lunes, Miércoles' -> {0, 2}. None si el texto está vacío o tiene algo que no es un día
+    (ej. un horario que no se pudo interpretar).
+    """
+    partes = [quitar_tildes(p) for p in str(dias_clase or "").split(",") if p.strip()]
+    if not partes or any(p not in DIAS_SEMANA for p in partes):
+        return None
+    return {DIAS_SEMANA[p] for p in partes}
+
+
+def revisar_atraso(vto, fecha_pago, dias_clase):
+    """
+    Pago atrasado = después del vto hubo una clase del alumno antes del día en que paga.
+    (Vence el lunes 4 y viene los miércoles: si paga el miércoles 6 está en término.
+    Vence el lunes 4, viene el martes 5 y paga el jueves 7: atrasado.)
+    El día del vto y el día del pago no cuentan como clase "sin pagar".
+    Devuelve (estado, fecha_de_la_clase):
+      'sin_fechas'  vto o fecha de pago vacíos/inválidos
+      'en_termino'  paga hasta el vto, o no tuvo clase entre el vto y el pago
+      'atrasado'    tuvo clase entre el vto y el pago (devuelve la primera)
+      'sin_dias'    paga después del vto pero no se sabe qué días viene
+    """
+    dt_vto = vto if isinstance(vto, date) else parsear_fecha(vto) if vto else None
+    dt_pago = fecha_pago if isinstance(fecha_pago, date) else parsear_fecha(fecha_pago) if fecha_pago else None
+    if not dt_vto or not dt_pago:
+        return "sin_fechas", None
+    if dt_pago <= dt_vto:
+        return "en_termino", None
+    dias = dias_semana_de_texto(dias_clase)
+    if dias is None:
+        return "sin_dias", None
+    d = dt_vto + timedelta(days=1)
+    while d < dt_pago:
+        if d.weekday() in dias:
+            return "atrasado", d
+        d += timedelta(days=1)
+    return "en_termino", None
 
 
 def formatear_moneda(valor):

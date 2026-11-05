@@ -10,7 +10,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Border, Side
 
 from alumnos_service import extraer_grupos_familiares, buscar_alumno_en_lista, indice_grupos
-from excel_manager import buscar_recibo_previo_del_grupo
+from excel_manager import recibos_del_grupo_para_dto, texto_recibo_gf
 
 LINEA = Side(style="thin")
 
@@ -66,18 +66,26 @@ class TestGruposFamiliares(unittest.TestCase):
         self.assertEqual(buscar_alumno_en_lista("aymee rosales", ALUMNOS), "Aymee Florencia Rosales")
         self.assertIsNone(buscar_alumno_en_lista("Juan Perez", ALUMNOS))
 
-    def test_recibo_previo_del_grupo(self):
+    def test_recibos_del_grupo_para_elegir(self):
         grupos = extraer_grupos_familiares(hoja_grupos(), ALUMNOS)
         self.assertEqual(indice_grupos(grupos)["alejandra marano"], 0)
         resumen = [
             {"nro": "182", "fecha": "23/10/2026", "nombre": "Marcelo Molina", "actividad": "Natación"},
             {"nro": "R90", "fecha": "01/11/2026", "nombre": "Alejandra Marano", "actividad": "Cobro de Saldo"},
             {"nro": "50", "fecha": "01/09/2026", "nombre": "Alejandra Marano", "actividad": "Natación"},
+            # Recibo de grupo donde Thiago también estaba: no sirve para justificar su dto.
+            {"nro": "328", "fecha": "02/10/2026", "nombre": "Alejandra Marano", "actividad": "Natación"},
+            {"nro": "328", "fecha": "02/10/2026", "nombre": "Thiago Salvador Molina", "actividad": "Natación"},
+            {"nro": "10", "fecha": "05/06/2026", "nombre": "Marcelo Molina", "actividad": "Natación"},
+            {"nro": "7", "fecha": "01/11/2026", "nombre": "Osvaldo Quiroga", "actividad": "Natación"},
         ]
-        previo = buscar_recibo_previo_del_grupo(resumen, ["Marcelo Molina", "Alejandra Marano"], "02/11/2026")
-        self.assertEqual((previo["nombre"], previo["nro"]), ("Marcelo Molina", "182"))
-        # Pasado el mes ya no cuenta
-        self.assertIsNone(buscar_recibo_previo_del_grupo(resumen, ["Marcelo Molina"], "24/11/2026"))
+        otros = ["Marcelo Molina", "Alejandra Marano"]
+        res = recibos_del_grupo_para_dto(resumen, "Thiago Salvador Molina", otros, "02/11/2026")
+        self.assertEqual([(r["nombre"], r["nro"]) for r in res], [("Marcelo Molina", "182"), ("Alejandra Marano", "50")])
+        self.assertEqual(texto_recibo_gf(res[0]), "GF Marcelo Molina R182 del 23/10")
+        # Para Marcelo sí vale el R328 (él no estaba en ese recibo)
+        res_m = recibos_del_grupo_para_dto(resumen, "Marcelo Molina", ["Alejandra Marano", "Thiago Salvador Molina"], "02/11/2026")
+        self.assertIn(("Alejandra Marano", "328"), [(r["nombre"], r["nro"]) for r in res_m])
 
 
 if __name__ == "__main__":
