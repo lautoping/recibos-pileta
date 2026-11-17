@@ -415,6 +415,22 @@ class AutocompleteEntry(ttk.Frame):
 # ==========================================================
 # COMPONENTE VISUAL PARA CADA ALUMNO DENTRO DEL RECIBO
 # ==========================================================
+class EtiquetaOcultable(ttk.Label):
+    """Label que avisa cuando cambia su texto, para ocultarla si queda vacía (no deja un renglón en blanco)."""
+
+    def __init__(self, master, al_cambiar_texto=None, **kw):
+        super().__init__(master, **kw)
+        self._al_cambiar_texto = al_cambiar_texto
+
+    def configure(self, cnf=None, **kw):
+        res = super().configure(cnf, **kw)
+        if self._al_cambiar_texto and ("text" in kw or (isinstance(cnf, dict) and "text" in cnf)):
+            self._al_cambiar_texto()
+        return res
+
+    config = configure
+
+
 class AlumnoItem:
     def __init__(self, parent_frame, index, app, es_titular=True):
         self.parent_frame = parent_frame
@@ -423,8 +439,14 @@ class AlumnoItem:
         self.es_titular = es_titular
 
         self.var_nombre = tk.StringVar()
-        self.var_usar_carnet = tk.BooleanVar(value=False)
+        # El carnet va tildado por defecto (casi todos los recibos llevan carnet), salvo en la CdA.
+        self.var_usar_carnet = tk.BooleanVar(value=True)
         self.var_nro_carnet = tk.StringVar(value="")
+        self._carnet_sugerido = None  # N° de carnet que propuso la app (si no se cambió a mano, se actualiza solo)
+        self._carnet_off_por_cda = False
+        self._j_auto = False  # 'Jubilado' puesto por la app según la planilla
+        self._gf_por_jubilado = False  # dto. GF puesto solo al titular porque un jubilado del grupo "va primero"
+        self._opciones_gf = []
         self.var_cobrar_carnet = tk.BooleanVar(value=False)
         self._vto_auto = None        # vto puesto por la app (vto del recibo anterior + 1 mes)
         self._insc_cda_auto = False  # inscripción "CdA" puesta por la app
@@ -463,6 +485,9 @@ class AlumnoItem:
 
         self._construir_ui()
         self._vincular_trazas()
+        self._reacomodar_infos()
+        if self.var_usar_carnet.get():
+            self.sugerir_carnet()
 
     def _construir_ui(self):
         tit_txt = f" Alumno {self.index} (Titular) " if self.es_titular else f" Alumno {self.index} (Grupo Familiar - GF) "
@@ -482,20 +507,20 @@ class AlumnoItem:
         self.autocomplete.pack(fill=tk.X, pady=(2, 0))
 
         # Etiqueta para mostrar los días de clase extraídos
-        self.lbl_dias_clase = ttk.Label(f_nom, text="", font=("Segoe UI", 8, "italic"), foreground="#0284c7")
-        self.lbl_dias_clase.pack(anchor=tk.W, pady=(2, 0))
+        # Las etiquetas de abajo solo ocupan lugar cuando tienen algo que mostrar
+        # (vacías dejaban un hueco en blanco debajo del nombre).
+        self.lbl_dias_clase = EtiquetaOcultable(
+            f_nom, self._reacomodar_infos, text="", font=("Segoe UI", 8, "italic"), foreground="#0284c7"
+        )
 
         # Pago atrasado (clase después del vto sin haber pagado): sin dto.
-        self.lbl_atraso = ttk.Label(f_nom, text="", font=("Segoe UI", 8, "bold"), foreground="#b91c1c")
-        self.lbl_atraso.pack(anchor=tk.W)
+        self.lbl_atraso = EtiquetaOcultable(f_nom, self._reacomodar_infos, text="", font=("Segoe UI", 8, "bold"), foreground="#b91c1c")
 
         # Vencimiento calculado desde el recibo anterior y CdA previa
-        self.lbl_previos = ttk.Label(f_nom, text="", font=("Segoe UI", 8), foreground="#0f766e")
-        self.lbl_previos.pack(anchor=tk.W)
+        self.lbl_previos = EtiquetaOcultable(f_nom, self._reacomodar_infos, text="", font=("Segoe UI", 8), foreground="#0f766e")
 
         # Grupo familiar (2da hoja de la planilla): otros integrantes, botones para sumarlos y dto. GF
         self.f_gf_info = ttk.Frame(f_nom)
-        self.f_gf_info.pack(anchor=tk.W, fill=tk.X)
 
         # Vencimiento individual por alumno
         self.f_venc = ttk.Frame(f1)
@@ -538,7 +563,7 @@ class AlumnoItem:
             width=8,
             font=("Segoe UI", 10, "bold"),
             justify="center",
-            state="disabled",
+            state="normal" if self.var_usar_carnet.get() else "disabled",
         )
         self.entry_carnet.pack(side=tk.LEFT)
         precio_car = formatear_moneda(self.app.precios_data.get("carnet", 1000.0)) if getattr(self.app, "precios_data", None) else "$1.000"
@@ -546,7 +571,7 @@ class AlumnoItem:
             f_car_in,
             text=f"Cobrar ({precio_car})",
             variable=self.var_cobrar_carnet,
-            state="disabled",
+            state="normal" if self.var_usar_carnet.get() else "disabled",
         )
         self.chk_cobrar_carnet.pack(side=tk.LEFT, padx=(4, 0))
 
@@ -638,8 +663,10 @@ class AlumnoItem:
         ttk.Label(self.f_gf_asociado, text="Recibo GF que justifica el dto.:", font=("Segoe UI", 9, "bold"), foreground="#1e40af").pack(
             anchor=tk.W
         )
+        # Editable: si el familiar no figura en la lista de GF de la planilla, el recibo se escribe a mano
+        # (ej. "R123 Juan Pérez"); se guarda en Observaciones como "GF R123 Juan Pérez".
         self.combo_gf_asociado = ttk.Combobox(
-            self.f_gf_asociado, textvariable=self.var_gf_asociado, width=34, font=("Segoe UI", 9), state="readonly"
+            self.f_gf_asociado, textvariable=self.var_gf_asociado, width=34, font=("Segoe UI", 9), state="normal"
         )
         self.combo_gf_asociado.pack(anchor=tk.W, pady=(2, 0))
         self.combo_gf_asociado.bind("<Button-1>", lambda e: self.actualizar_opciones_gf_asociado(), add="+")
@@ -699,14 +726,29 @@ class AlumnoItem:
 
             # Si la 3ra columna dice jubilado/a, marcar directamente la opción Jubilado!
             if det.get("es_jubilado"):
-                self.var_descuento.set("Jubilado")
+                if self.var_descuento.get() != "Jubilado":
+                    self.var_descuento.set("Jubilado")
+                self._j_auto = True
+            else:
+                self._quitar_jubilado_auto()
         else:
             if self.lbl_dias_clase:
                 self.lbl_dias_clase.config(text="")
+            self._quitar_jubilado_auto()
 
         if hasattr(self.app, "_refrescar_info_gf"):
             self.app._refrescar_info_gf()
         self.app._actualizar_calculo_precio()
+
+    def _quitar_jubilado_auto(self):
+        """Si el 'Jubilado' lo había puesto la app por el alumno anterior, se vuelve al dto. normal."""
+        if getattr(self, "_j_auto", False) and self.var_descuento.get() == "Jubilado":
+            if self.es_titular:
+                mp = self.app.var_metodo_pago.get() if hasattr(self.app, "var_metodo_pago") else "Transferencia"
+                self.var_descuento.set("Efectivo" if mp == "Efectivo" else "Ninguno")
+            else:
+                self.var_descuento.set("Grupo familiar")
+        self._j_auto = False
 
     def actualizar_info_gf(self):
         """
@@ -717,6 +759,30 @@ class AlumnoItem:
         """
         if not self.f_gf_info or not hasattr(self.app, "grupo_de"):
             return
+        try:
+            self._armar_info_gf()
+        finally:
+            self._reacomodar_infos()
+
+    def _reacomodar_infos(self):
+        """Muestra debajo del nombre solo las etiquetas con texto (en orden), sin renglones vacíos."""
+        orden = [
+            (getattr(self, "lbl_dias_clase", None), {"pady": (2, 0)}),
+            (getattr(self, "lbl_atraso", None), {}),
+            (getattr(self, "lbl_previos", None), {}),
+            (getattr(self, "f_gf_info", None), {"fill": tk.X}),
+        ]
+        for w, _ in orden:
+            if w is not None:
+                w.pack_forget()
+        for w, extra in orden:
+            if w is None:
+                continue
+            visible = bool(w.winfo_children()) if isinstance(w, ttk.Frame) else bool(str(w.cget("text")).strip())
+            if visible:
+                w.pack(anchor=tk.W, **extra)
+
+    def _armar_info_gf(self):
         for w in self.f_gf_info.winfo_children():
             w.destroy()
 
@@ -767,19 +833,22 @@ class AlumnoItem:
         nom = self.var_nombre.get().strip()
         recibos = self.app.recibos_gf_elegibles(nom) if nom and hasattr(self.app, "recibos_gf_elegibles") else []
         opciones = [texto_recibo_gf(r) for r in recibos]
+        anteriores = self._opciones_gf
+        self._opciones_gf = opciones
         self.combo_gf_asociado.config(values=opciones)
         actual = self.var_gf_asociado.get().strip()
-        if actual and actual not in opciones:
+        # Si se había elegido de la lista de otro alumno, se borra; lo escrito a mano se respeta.
+        if actual and actual not in opciones and actual in anteriores:
             self.var_gf_asociado.set("")
         if self.lbl_gf_asociado_aviso:
             if not nom:
                 aviso = ""
             elif not (hasattr(self.app, "grupo_de") and self.app.grupo_de(nom)):
-                aviso = "No figura en ningún grupo familiar de la planilla."
+                aviso = "No figura en ningún grupo familiar de la planilla: escribí el recibo a mano (ej. R123 Juan Pérez)."
             elif not opciones:
-                aviso = "Ningún otro integrante tiene recibos en los últimos 3 meses."
+                aviso = "Ningún otro integrante tiene recibos en los últimos 3 meses: escribilo a mano si hace falta."
             else:
-                aviso = ""
+                aviso = "Elegilo de la lista o escribilo a mano."
             self.lbl_gf_asociado_aviso.config(text=aviso)
 
     def _al_cambiar_descuento(self, *args):
@@ -791,7 +860,7 @@ class AlumnoItem:
     def _actualizar_visibilidad_gf_asociado(self):
         if hasattr(self, "f_gf_asociado") and self.f_gf_asociado:
             es_solo = len(getattr(self.app, "alumnos_items", [])) <= 1
-            if self.var_descuento.get() == "Grupo familiar" and (self.es_titular or es_solo):
+            if self.var_descuento.get() == "Grupo familiar" and self.es_titular and es_solo:
                 self.f_gf_asociado.pack(side=tk.LEFT, padx=(10, 0))
             else:
                 self.f_gf_asociado.pack_forget()
@@ -804,20 +873,42 @@ class AlumnoItem:
         self._actualizar_visibilidad_gf_asociado()
         self.actualizar_etiqueta_subtotal()
 
-    def _toggle_carnet(self):
+    def _toggle_carnet(self, enfocar=True):
         if self.var_usar_carnet.get():
             self.entry_carnet.config(state="normal")
             if not self.var_nro_carnet.get().strip():
-                sug = self.app._sugerir_proximo_carnet(self)
-                self.var_nro_carnet.set(str(sug))
-            self.entry_carnet.focus_set()
+                self.sugerir_carnet()
+            if enfocar:
+                self.entry_carnet.focus_set()
         else:
             self.entry_carnet.config(state="disabled")
             self.var_nro_carnet.set("")
+            self._carnet_sugerido = None
             self.var_cobrar_carnet.set(False)
         if hasattr(self, "chk_cobrar_carnet"):
             self.chk_cobrar_carnet.config(state="normal" if self.var_usar_carnet.get() else "disabled")
         self.app._actualizar_calculo_precio()
+
+    def activar_carnet(self, activar):
+        """Tilda o destilda 'Asignar N°' sin mover el cursor (lo usa la app al limpiar y con la CdA)."""
+        if self.var_usar_carnet.get() != activar:
+            self.var_usar_carnet.set(activar)
+        self._toggle_carnet(enfocar=False)
+
+    def sugerir_carnet(self):
+        """
+        Propone el próximo N° de carnet. Si el número que hay es el que había propuesto la app
+        (no se cambió a mano), lo actualiza; uno escrito a mano no se toca.
+        """
+        if not self.var_usar_carnet.get() or not hasattr(self.app, "_sugerir_proximo_carnet"):
+            return
+        actual = self.var_nro_carnet.get().strip()
+        if actual and actual != (self._carnet_sugerido or ""):
+            return
+        sug = str(self.app._sugerir_proximo_carnet(self))
+        self._carnet_sugerido = sug
+        if actual != sug:
+            self.var_nro_carnet.set(sug)
 
     def monto_carnet(self):
         """Precio del carnet si se cobra junto con la cuota en este recibo."""
@@ -933,6 +1024,15 @@ class AlumnoItem:
         else:
             self.var_actividad_otro.set("")
             self.entry_actividad_otro.config(state="disabled")
+
+        # La CdA no lleva carnet; al salir de CdA se vuelve a tildar.
+        if act == "Clase Adaptación (CdA)":
+            if self.var_usar_carnet.get():
+                self._carnet_off_por_cda = True
+                self.activar_carnet(False)
+        elif self._carnet_off_por_cda:
+            self._carnet_off_por_cda = False
+            self.activar_carnet(True)
 
         if act == "Clase Adaptación (CdA)":
             self._habilitar_clases(False)
@@ -1121,6 +1221,8 @@ class AlumnoItem:
                 desc_txt = "Jubilado/a"
             elif desc_sel == "Grupo familiar" and self.es_titular:
                 gf_extra = f" [{self.var_gf_asociado.get().strip()}]" if self.var_gf_asociado.get().strip() else ""
+                if self._gf_por_jubilado:
+                    gf_extra = " - el jubilado/a va primero en el recibo"
                 desc_txt = f"Grupo familiar{gf_extra}"
             elif self.es_titular and hasattr(self.app, "var_metodo_pago") and self.app.var_metodo_pago.get() == "Mixto":
                 tipo_m = self.app.var_tipo_mixto.get() if hasattr(self.app, "var_tipo_mixto") else "Efectivo + Transferencia"
@@ -1262,7 +1364,8 @@ class DialogoConfigAlumnos:
 # DIÁLOGO MODAL PARA COBRO DE SALDOS PENDIENTES
 # ==========================================================
 class DialogoPagoPendiente:
-    def __init__(self, parent, ruta_recibos, on_guardar_callback, recibo_preseleccionado=None, precios_data=None):
+    def __init__(self, parent, ruta_recibos, on_guardar_callback, recibo_preseleccionado=None, precios_data=None,
+                 fecha_por_defecto=None):
         self.parent = parent
         self.ruta_recibos = ruta_recibos
         self.on_guardar_callback = on_guardar_callback
@@ -1289,7 +1392,9 @@ class DialogoPagoPendiente:
 
         self.recibo_seleccionado = None
         self.var_combo_sel = tk.StringVar()
-        self.var_fecha_pago = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
+        # Por defecto, la fecha que se viene usando en los recibos (no la de hoy de la PC)
+        dt_def = parsear_fecha(fecha_por_defecto) if fecha_por_defecto else None
+        self.var_fecha_pago = tk.StringVar(value=(dt_def or date.today()).strftime("%d/%m/%Y"))
         self.var_metodo_pago = tk.StringVar(value="Efectivo")
         self.var_monto_pago = tk.StringVar()
         self.var_saldar_total = tk.BooleanVar(value=False)
@@ -1821,4 +1926,154 @@ class DialogoCarnetSinRecibo:
             "Carnet Registrado",
             f"Carnet N° {car_num} para {nom} registrado con éxito en el Excel.",
             parent=self.parent
+        )
+
+
+# ==========================================================
+# DIÁLOGO: RECIBOS CON N° REPETIDO (REHACER UNO CON EL N° QUE SIGUE)
+# ==========================================================
+class DialogoRecibosDuplicados:
+    """
+    Lista los N° de recibo que se usaron en dos recibos distintos con pocos días de diferencia
+    (no cuenta las personas de un mismo recibo de grupo familiar). Se elige el N°, después cuál
+    de los recibos hay que rehacer, y se pasa al N° que sigue en el talonario con la fecha en uso.
+    """
+
+    def __init__(self, parent, ruta_recibos, proximo_nro, fecha_emision, on_guardar_callback=None):
+        from excel_manager import buscar_recibos_duplicados, rehacer_recibo
+
+        self.parent = parent
+        self.ruta_recibos = ruta_recibos
+        self.proximo_nro = proximo_nro
+        self.fecha_emision = fecha_emision
+        self.on_guardar_callback = on_guardar_callback
+        self._rehacer_fn = rehacer_recibo
+        self.dlg = None
+
+        try:
+            self.duplicados = buscar_recibos_duplicados(ruta_recibos)
+        except Exception as e:
+            messagebox.showerror("Recibos repetidos", f"No se pudo leer el Excel de recibos:\n{e}", parent=parent)
+            return
+        if not self.duplicados:
+            messagebox.showinfo(
+                "Recibos repetidos",
+                "No hay recibos con el N° repetido (dos recibos distintos con el mismo número en pocos días).",
+                parent=parent,
+            )
+            return
+
+        self.dlg = tk.Toplevel(parent)
+        self.dlg.title("Recibos con N° repetido")
+        self.dlg.geometry("720x430")
+        self.dlg.transient(parent)
+        self.dlg.grab_set()
+
+        self.var_nro = tk.StringVar()
+        self.var_elegido = tk.IntVar(value=-1)
+        self._construir_ui()
+
+    def _construir_ui(self):
+        frame = ttk.Frame(self.dlg, padding="16 14 16 14")
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="Rehacer un recibo con N° repetido", font=("Segoe UI", 12, "bold"), foreground="#0f172a").pack(anchor=tk.W)
+        ttk.Label(
+            frame,
+            text=(
+                "Elegí el N° repetido y cuál de los recibos hay que rehacer. Ese recibo pasa al N° que sigue "
+                f"en el talonario (N° {self.proximo_nro}) con la fecha de emisión en uso ({self.fecha_emision}). "
+                "Se conservan personas, montos, vto, método de pago y carnet, y en Observaciones queda anotado "
+                "el número y la fecha que tenía."
+            ),
+            font=("Segoe UI", 9),
+            foreground="#475569",
+            wraplength=680,
+        ).pack(anchor=tk.W, pady=(2, 10))
+
+        f_sel = ttk.Frame(frame)
+        f_sel.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(f_sel, text="N° repetido:", style="Field.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        opciones = []
+        for d in self.duplicados:
+            fechas = " y ".join(b["fecha"][:5] for b in d["recibos"])
+            opciones.append(f"R{d['nro']}  ({len(d['recibos'])} recibos: {fechas})")
+        self.combo = ttk.Combobox(f_sel, textvariable=self.var_nro, values=opciones, state="readonly", width=48)
+        self.combo.pack(side=tk.LEFT)
+        self.combo.bind("<<ComboboxSelected>>", lambda e: self._mostrar_recibos())
+
+        self.f_recibos = ttk.LabelFrame(frame, text=" ¿Cuál hay que rehacer? ", padding="10 6 10 6")
+        self.f_recibos.pack(fill=tk.BOTH, expand=True)
+
+        f_btn = ttk.Frame(frame)
+        f_btn.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(f_btn, text="Cancelar", command=self.dlg.destroy).pack(side=tk.RIGHT)
+        self.btn_rehacer = ttk.Button(
+            f_btn, text=f"🔁 Rehacer con N° {self.proximo_nro}", command=self._rehacer, state="disabled"
+        )
+        self.btn_rehacer.pack(side=tk.RIGHT, padx=(0, 8))
+
+        self.combo.current(0)
+        self._mostrar_recibos()
+
+    def _dup_actual(self):
+        i = self.combo.current()
+        return self.duplicados[i] if 0 <= i < len(self.duplicados) else None
+
+    def _mostrar_recibos(self):
+        for w in self.f_recibos.winfo_children():
+            w.destroy()
+        self.var_elegido.set(-1)
+        self.btn_rehacer.config(state="disabled")
+        d = self._dup_actual()
+        if not d:
+            return
+        for i, b in enumerate(d["recibos"]):
+            nombres = ", ".join(n for n in b["nombres"] if n)
+            txt = f"R{b['nro']} del {b['fecha']} [{b['hoja']}, fila {b['fila']}] - {nombres} - {formatear_moneda(b['total'])}"
+            ttk.Radiobutton(
+                self.f_recibos,
+                text=txt,
+                value=i,
+                variable=self.var_elegido,
+                command=lambda: self.btn_rehacer.config(state="normal"),
+            ).pack(anchor=tk.W, pady=2)
+
+    def _rehacer(self):
+        d = self._dup_actual()
+        i = self.var_elegido.get()
+        if not d or not (0 <= i < len(d["recibos"])):
+            return
+        b = d["recibos"][i]
+        nombres = ", ".join(n for n in b["nombres"] if n)
+        if not messagebox.askyesno(
+            "Rehacer recibo",
+            f"El recibo R{b['nro']} del {b['fecha']} ({nombres}) pasa a ser el R{self.proximo_nro} "
+            f"del {self.fecha_emision}.\n\n¿Continuar?",
+            parent=self.dlg,
+        ):
+            return
+        try:
+            n = self._rehacer_fn(
+                self.ruta_recibos, b["hoja"], b["fila"], b["nro"], b["fecha"], self.proximo_nro, self.fecha_emision
+            )
+        except PermissionError:
+            messagebox.showerror(
+                "Archivo Excel Abierto",
+                "No se pudo guardar porque 'recibos.xlsx' está abierto en Excel. Cerralo y probá de nuevo.",
+                parent=self.dlg,
+            )
+            return
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo rehacer el recibo:\n{e}", parent=self.dlg)
+            return
+        if not n:
+            messagebox.showwarning("Rehacer recibo", "No encontré ese recibo en el Excel (¿se modificó recién?).", parent=self.dlg)
+            return
+        self.dlg.destroy()
+        if self.on_guardar_callback:
+            self.on_guardar_callback()
+        messagebox.showinfo(
+            "Recibo rehecho",
+            f"Listo: el recibo de {nombres} quedó como R{self.proximo_nro} del {self.fecha_emision} ({n} fila/s).",
+            parent=self.parent,
         )

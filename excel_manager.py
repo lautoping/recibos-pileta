@@ -293,12 +293,29 @@ def _copia_de_seguridad(ruta):
         print(f"Aviso: no se pudo crear la copia de seguridad: {e}")
 
 
+def _dejar_una_hoja_seleccionada(wb):
+    """
+    Deja activa y seleccionada SOLO la hoja del último mes.
+    openpyxl, al cambiar la hoja activa, no destilda la que estaba seleccionada antes; Excel abre
+    entonces las dos hojas agrupadas ("[Grupo]") y todo lo que se escribe en una se copia en la
+    otra en la misma celda (así se pisaron filas de Octubre al editar Noviembre).
+    """
+    hojas = _hojas_ordenadas(wb) or wb.worksheets
+    if not hojas:
+        return
+    activa = hojas[-1]
+    for ws in wb.worksheets:
+        ws.sheet_view.tabSelected = ws is activa
+    wb.active = wb.worksheets.index(activa)
+
+
 def _guardar_wb(wb, ruta):
     """
     Guarda sin riesgo de dejar el Excel a medio escribir: primero en un archivo temporal
     y después lo reemplaza de una sola vez. Si recibos.xlsx está abierto en Excel, lanza PermissionError.
     """
     _copia_de_seguridad(ruta)
+    _dejar_una_hoja_seleccionada(wb)
     carpeta = os.path.dirname(os.path.abspath(ruta))
     fd, tmp = tempfile.mkstemp(prefix="~guardando_", suffix=".xlsx", dir=carpeta)
     os.close(fd)
@@ -408,10 +425,7 @@ def asegurar_excel_recibos(ruta_recibos, fecha_referencia=None):
             cambio = True
 
         if cambio:
-            hojas = _hojas_ordenadas(wb)
-            if hojas:
-                wb.active = wb.worksheets.index(hojas[-1])
-            _guardar_wb(wb, ruta_recibos)
+            _guardar_wb(wb, ruta_recibos)  # deja activa solo la hoja del último mes
     except PermissionError:
         raise
     except Exception as e:
@@ -492,14 +506,20 @@ def obtener_estado_recibos(ruta_recibos):
                 proximo_recibo = 1
             break
 
+    # Próximo carnet: el mayor del último recibo con carnet + 1 (en un recibo de grupo familiar
+    # las filas pueden no estar en orden de carnet, por ej. cuando el jubilado/a va primero).
     proximo_carnet = 1
+    ultimo_rec = None
     for f in reversed(filas):
         val_car = f.get("Nro Carnet")
+        clave = (_nro_normalizado(f.get("Nro Recibo")), _fecha_normalizada(f.get("Fecha Emisión")))
+        if ultimo_rec is not None and clave != ultimo_rec:
+            break
         if val_car not in (None, ""):
             m = re.search(r"\b(\d+)\b", _nro_normalizado(val_car))
             if m:
-                proximo_carnet = int(m.group(1)) + 1
-                break
+                proximo_carnet = max(proximo_carnet, int(m.group(1)) + 1)
+                ultimo_rec = clave
 
     ultima_fecha_emision = None
     for f in reversed(filas):
@@ -567,6 +587,19 @@ def guardar_fila_recibo(ruta_recibos, fila_datos):
     guardar_filas_recibo(ruta_recibos, [fila_datos])
 
 
+def _sigue_mismo_recibo(ws, r_ant, r):
+    """
+    True si la fila r es otra persona del mismo recibo que la fila r_ant (que está justo arriba y tiene
+    el mismo N° y fecha). En un recibo de grupo familiar el Total va solo en la última fila, o todas
+    dicen "Recibo grupal" en Observaciones. Si no, son dos recibos distintos con el mismo número.
+    """
+    if ws.cell(row=r_ant, column=COL_TOTAL).value in (None, ""):
+        return True
+    obs_ant = quitar_tildes(ws.cell(row=r_ant, column=COL_OBS).value or "")
+    obs = quitar_tildes(ws.cell(row=r, column=COL_OBS).value or "")
+    return "recibo grupal" in obs_ant and "recibo grupal" in obs
+
+
 def _filas_del_recibo(ws, nro_recibo, fecha_emision, fila_ref=None):
     """
     Filas de una hoja con ese N° de recibo Y esa fecha de emisión (un mismo recibo, aunque sea grupal).
@@ -587,10 +620,10 @@ def _filas_del_recibo(ws, nro_recibo, fecha_emision, fila_ref=None):
         if not (2 <= fila_ref <= ultima) or not coincide(fila_ref):
             return []
         ini = fila_ref
-        while ini - 1 >= 2 and coincide(ini - 1):
+        while ini - 1 >= 2 and coincide(ini - 1) and _sigue_mismo_recibo(ws, ini - 1, ini):
             ini -= 1
         fin = fila_ref
-        while fin + 1 <= ultima and coincide(fin + 1):
+        while fin + 1 <= ultima and coincide(fin + 1) and _sigue_mismo_recibo(ws, fin, fin + 1):
             fin += 1
         return list(range(ini, fin + 1))
     return [r for r in range(2, ultima + 1) if coincide(r)]
@@ -680,14 +713,26 @@ def eliminar_recibo_por_numero(ruta_recibos, nro_recibo, fecha_emision=None):
     return eliminar_recibo(ruta_recibos, nro_recibo, fecha_emision) > 0
 
 
-def resumen_recibos(ruta_recibos):
-    """Lista liviana de todos los recibos (todas las hojas) para buscar recibos anteriores de un grupo familiar."""
+def resumen_recibos(ruta_recibos, reintentos=4, espera=0.5):
+    """
+    Lista liviana de todos los recibos (todas las hojas): de acá salen el vto automático, los datos
+    del último recibo, la CdA previa y los recibos GF.
+    Justo después de guardar, OneDrive puede tener el archivo tomado un instante: se reintenta y,
+    si igual no se puede leer, devuelve None (no una lista vacía) para que la app conserve lo que
+    ya tenía en vez de quedarse sin recibos anteriores (y sin vto automático).
+    """
     if not os.path.exists(ruta_recibos):
         return []
-    try:
-        wb = load_workbook(ruta_recibos, read_only=True, data_only=True)
-    except Exception:
-        return []
+    wb = None
+    for intento in range(max(1, reintentos)):
+        try:
+            wb = load_workbook(ruta_recibos, read_only=True, data_only=True)
+            break
+        except Exception:
+            if intento < reintentos - 1:
+                time.sleep(espera)
+    if wb is None:
+        return None
     res = []
     hojas = sorted((w for w in wb.worksheets if _clave_hoja(w.title)), key=lambda w: _clave_hoja(w.title))
     for ws in hojas:
@@ -709,6 +754,127 @@ def resumen_recibos(ruta_recibos):
 
 
 ACTIVIDADES_SIN_CUOTA = ("Cobro de Saldo", "Carnet", "Solo Inscripción", "Clase Adaptación (CdA)")
+
+
+# ==========================================================
+# RECIBOS CON N° REPETIDO (dos recibos distintos con el mismo número)
+# ==========================================================
+def _es_fila_de_recibo(actividad):
+    act = str(actividad or "")
+    return act not in ACTIVIDADES_NO_RECIBO and not act.startswith("Carnet")
+
+
+def _bloques_de_recibos(wb):
+    """
+    Cada recibo como un bloque: las filas seguidas de una hoja con el mismo N° y la misma fecha
+    (así un recibo de grupo familiar, con varias personas, cuenta como UN recibo).
+    """
+    bloques = []
+    for ws in _hojas_ordenadas(wb):
+        actual = None
+        for r in range(2, _ultima_fila_con_datos(ws) + 1):
+            act = ws.cell(row=r, column=COL_ACTIVIDAD).value
+            nro = _nro_normalizado(ws.cell(row=r, column=COL_NRO).value)
+            if not nro or not _es_fila_de_recibo(act):
+                actual = None
+                continue
+            fecha = _fecha_normalizada(ws.cell(row=r, column=COL_FECHA).value)
+            if (
+                actual
+                and actual["nro"] == nro
+                and actual["fecha"] == fecha
+                and actual["_ultima"] == r - 1
+                and _sigue_mismo_recibo(ws, r - 1, r)
+            ):
+                actual["filas"].append(r)
+            else:
+                actual = {"hoja": ws.title, "nro": nro, "fecha": fecha, "filas": [r]}
+                bloques.append(actual)
+            actual["_ultima"] = r
+            actual.setdefault("nombres", []).append(str(ws.cell(row=r, column=COL_NOMBRE).value or "").strip())
+            if "anulad" in quitar_tildes(ws.cell(row=r, column=COL_OBS).value or ""):
+                actual["anulado"] = True
+            tot = ws.cell(row=r, column=COL_TOTAL).value
+            if tot not in (None, ""):
+                actual["total"] = actual.get("total", 0.0) + _a_numero(tot)
+    for b in bloques:
+        b.pop("_ultima", None)
+        b["fila"] = b["filas"][0]
+        b.setdefault("total", 0.0)
+    return bloques
+
+
+def buscar_recibos_duplicados(ruta_recibos, dias=DIAS_AVISO_REPETIDO):
+    """
+    Números de recibo usados en dos (o más) recibos distintos con pocos días de diferencia:
+    el error de anotar el mismo N° a dos personas. Las varias personas de un mismo recibo de grupo
+    familiar NO cuentan como repetido, ni el mismo número de otra vuelta del talonario (1-400).
+    Devuelve [{"nro": "242", "recibos": [bloque, bloque, ...]}], el más reciente primero.
+    """
+    if not os.path.exists(ruta_recibos):
+        return []
+    wb = load_workbook(ruta_recibos, data_only=True)
+    por_nro = {}
+    for b in _bloques_de_recibos(wb):
+        if b.get("anulado"):
+            continue  # un recibo anulado no es un repetido
+        dt = parsear_fecha(b["fecha"])
+        if dt:
+            b["_dt"] = dt
+            por_nro.setdefault(b["nro"], []).append(b)
+    res = []
+    for nro, lista in por_nro.items():
+        lista.sort(key=lambda b: (b["_dt"], b["hoja"], b["fila"]))
+        grupo = [lista[0]]
+        for b in lista[1:]:
+            if (b["_dt"] - grupo[-1]["_dt"]).days <= dias:
+                grupo.append(b)
+            else:
+                if len(grupo) > 1:
+                    res.append({"nro": nro, "recibos": grupo})
+                grupo = [b]
+        if len(grupo) > 1:
+            res.append({"nro": nro, "recibos": grupo})
+    res.sort(key=lambda d: d["recibos"][-1]["_dt"], reverse=True)
+    for d in res:
+        for b in d["recibos"]:
+            b.pop("_dt", None)
+    return res
+
+
+def rehacer_recibo(ruta_recibos, hoja, fila_ref, nro_recibo, fecha_emision, nuevo_nro, nueva_fecha):
+    """
+    Rehace un recibo que quedó con el N° repetido: lo pasa al N° nuevo (el que sigue en el talonario)
+    con la fecha de emisión nueva, en la hoja de ese mes y al final (así la numeración sigue desde ahí).
+    Conserva todo lo demás (personas, montos, vto, método, carnet, estado) y anota en Observaciones
+    el número y la fecha que tenía. Devuelve cuántas filas movió.
+    """
+    dt_nueva = parsear_fecha(nueva_fecha)
+    if not dt_nueva:
+        raise ValueError("La fecha de emisión nueva no es válida.")
+    wb = load_workbook(ruta_recibos)
+    if hoja not in wb.sheetnames:
+        return 0
+    ws = wb[hoja]
+    filas = _filas_del_recibo(ws, nro_recibo, fecha_emision, fila_ref)
+    if not filas:
+        return 0
+    nota = f"Rehecho: antes R{_nro_normalizado(nro_recibo)} del {_fecha_normalizada(fecha_emision)[:5]} (N° repetido)"
+    datos = []
+    for r in filas:
+        d = {col: ws.cell(row=r, column=i).value for i, col in enumerate(COLUMNAS_RECIBOS, start=1)}
+        d = {k: ("" if v is None else v) for k, v in d.items()}
+        d["Nro Recibo"] = int(nuevo_nro)
+        d["Fecha Emisión"] = dt_nueva.strftime("%d/%m/%Y")
+        obs = str(d.get("Observaciones") or "").strip()
+        d["Observaciones"] = f"{obs} | {nota}" if obs else nota
+        datos.append(d)
+    for r in sorted(filas, reverse=True):
+        ws.delete_rows(r, 1)
+    for d in datos:
+        _agregar_fila(wb, d)
+    _guardar_wb(wb, ruta_recibos)
+    return len(filas)
 
 
 def _es_de(r, nombre):
