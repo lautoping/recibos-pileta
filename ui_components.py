@@ -445,10 +445,10 @@ class AlumnoItem:
         self._carnet_sugerido = None  # N° de carnet que propuso la app (si no se cambió a mano, se actualiza solo)
         self._carnet_off_por_cda = False
         self._j_auto = False  # 'Jubilado' puesto por la app según la planilla
-        self._gf_por_jubilado = False  # dto. GF puesto solo al titular porque un jubilado del grupo "va primero"
         self._opciones_gf = []
         self.var_cobrar_carnet = tk.BooleanVar(value=False)
         self._vto_auto = None        # vto puesto por la app (vto del recibo anterior + 1 mes)
+        self._vto_pagado = None      # vto del recibo anterior: el período que se está pagando (para el atraso)
         self._insc_cda_auto = False  # inscripción "CdA" puesta por la app
         self._previos_nombre = None  # alumno para el que ya se trajeron método de pago y clases/sem
         self._previos_txt = ""       # texto que explica de qué recibo se trajeron
@@ -724,8 +724,9 @@ class AlumnoItem:
             if self.lbl_dias_clase:
                 self.lbl_dias_clase.config(text=txt_dias)
 
-            # Si la 3ra columna dice jubilado/a, marcar directamente la opción Jubilado!
-            if det.get("es_jubilado"):
+            # Si la 3ra columna dice jubilado/a, marcar Jubilado. Pero en el 2do integrante en adelante
+            # tiene prioridad Grupo familiar (es el menor precio): ahí no se cambia a Jubilado.
+            if det.get("es_jubilado") and (self.es_titular or self.var_descuento.get() != "Grupo familiar"):
                 if self.var_descuento.get() != "Jubilado":
                     self.var_descuento.set("Jubilado")
                 self._j_auto = True
@@ -937,6 +938,8 @@ class AlumnoItem:
                 vto, ant = self.app.vto_desde_anterior(nom)
             actual = self.var_fecha_vencimiento.get().strip()
             general = self.app.var_fecha_vencimiento.get().strip() if hasattr(self.app, "var_fecha_vencimiento") else ""
+            # El atraso se revisa contra el vto que se está pagando (el del recibo anterior), no contra el nuevo.
+            self._vto_pagado = ant["vto"] if (vto and ant and ant.get("vto")) else None
             if vto:
                 if actual in ("", general, self._vto_auto or ""):
                     self.var_fecha_vencimiento.set(vto)
@@ -1171,13 +1174,17 @@ class AlumnoItem:
         detalles = getattr(self.app, "detalles_alumnos", {}) or {}
         det = detalles.get(quitar_tildes(" ".join(nom.split()))) or detalles.get(nom) or {}
         fecha_pago = self.app.var_fecha_emision.get() if hasattr(self.app, "var_fecha_emision") else ""
-        return revisar_atraso(self.var_fecha_vencimiento.get().strip(), fecha_pago, det.get("dias_clase", ""))
+        return revisar_atraso(self.vto_para_atraso(), fecha_pago, det.get("dias_clase", ""))
+
+    def vto_para_atraso(self):
+        """Vto que se está pagando: el del recibo anterior si lo hay; si no, el del recibo."""
+        return self._vto_pagado or self.var_fecha_vencimiento.get().strip()
 
     def mostrar_atraso(self, estado):
         """Muestra debajo de los días de clase si el pago es atrasado."""
         if not getattr(self, "lbl_atraso", None):
             return
-        vto = self.var_fecha_vencimiento.get().strip()[:5]
+        vto = self.vto_para_atraso()[:5]
         if not estado:
             txt, color = "", "#b91c1c"
         elif estado[0] == "atrasado":
@@ -1191,7 +1198,7 @@ class AlumnoItem:
             txt = f"⚠ Venció el {vto} y no se conocen sus días de clase: revisar a mano si es fuera de término"
             color = "#b45309"
         elif estado[0] == "en_termino" and (parsear_fecha(self.app.var_fecha_emision.get()) or date.min) \
-                > (parsear_fecha(self.var_fecha_vencimiento.get().strip()) or date.max):
+                > (parsear_fecha(self.vto_para_atraso()) or date.max):
             txt = f"✅ Venció el {vto} pero no tuvo clase desde entonces: en término"
             color = "#15803d"
         else:
@@ -1221,8 +1228,6 @@ class AlumnoItem:
                 desc_txt = "Jubilado/a"
             elif desc_sel == "Grupo familiar" and self.es_titular:
                 gf_extra = f" [{self.var_gf_asociado.get().strip()}]" if self.var_gf_asociado.get().strip() else ""
-                if self._gf_por_jubilado:
-                    gf_extra = " - el jubilado/a va primero en el recibo"
                 desc_txt = f"Grupo familiar{gf_extra}"
             elif self.es_titular and hasattr(self.app, "var_metodo_pago") and self.app.var_metodo_pago.get() == "Mixto":
                 tipo_m = self.app.var_tipo_mixto.get() if hasattr(self.app, "var_tipo_mixto") else "Efectivo + Transferencia"

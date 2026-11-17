@@ -1063,50 +1063,7 @@ class ReemplazoCuadernoApp:
         for item, est in por_item:
             item.mostrar_atraso(est)
 
-    def _ajustar_dto_por_jubilado(self):
-        """
-        Recibo de grupo familiar con un jubilado/a: el jubilado va primero (con dto. Jubilado) y los demás
-        con dto. GF, que es lo que da el menor precio. Si el titular cargado no es el jubilado, se le pone
-        dto. GF solo. Se aplica cuando cambia quién está en el recibo, así un cambio a mano se respeta.
-        """
-        if getattr(self, "_ajustando_dto_j", False) or not self.alumnos_items:
-            return
-        titular = self.alumnos_items[0]
-        hay_j = len(self.alumnos_items) > 1 and any(
-            it.var_descuento.get() == "Jubilado" for it in self.alumnos_items[1:]
-        )
-        firma = (len(self.alumnos_items), hay_j, titular.var_descuento.get() == "Jubilado")
-        if firma == getattr(self, "_dto_j_firma", None):
-            return
-        self._dto_j_firma = firma
-        self._ajustando_dto_j = True
-        try:
-            desc_tit = titular.var_descuento.get()
-            if hay_j and desc_tit not in ("Jubilado", "Grupo familiar"):
-                titular._gf_por_jubilado = True
-                titular.var_descuento.set("Grupo familiar")
-            elif not hay_j and titular._gf_por_jubilado:
-                titular._gf_por_jubilado = False
-                if desc_tit == "Grupo familiar":
-                    mp = self.var_metodo_pago.get()
-                    titular.var_descuento.set("Efectivo" if mp == "Efectivo" else "Ninguno")
-            elif desc_tit != "Grupo familiar":
-                titular._gf_por_jubilado = False
-        finally:
-            self._ajustando_dto_j = False
-
-    def _items_en_orden_de_guardado(self):
-        """Personas en el orden en que se guardan: si hay un jubilado/a y el titular no lo es, va primero."""
-        items = list(self.alumnos_items)
-        if len(items) > 1 and items[0].var_descuento.get() != "Jubilado":
-            for i, it in enumerate(items[1:], start=1):
-                if it.var_descuento.get() == "Jubilado":
-                    items.insert(0, items.pop(i))
-                    break
-        return items
-
     def _actualizar_calculo_precio(self, *args):
-        self._ajustar_dto_por_jubilado()
         self._revisar_atrasos()
         total_calculado = 0.0
         desglose_parts = []
@@ -1365,12 +1322,6 @@ class ReemplazoCuadernoApp:
 
         saldo_total_recibo = max(0.0, total_final - total_abonado)
 
-        # Orden de las filas en el Excel: el jubilado/a de un grupo familiar va primero
-        orden = self._items_en_orden_de_guardado()
-        pos = [self.alumnos_items.index(it) for it in orden]
-        subtotales_alumnos = [subtotales_alumnos[i] for i in pos]
-        fechas_venc_alumnos = [fechas_venc_alumnos[i] for i in pos]
-
         fecha_emision_str = dt_emision.strftime("%d/%m/%Y")
         mp = self.var_metodo_pago.get()
         if mp == "Mixto":
@@ -1417,7 +1368,7 @@ class ReemplazoCuadernoApp:
         restante_abonado = total_abonado
         fuera_termino = self.var_pago_vencido.get()
 
-        for idx, item in enumerate(orden):
+        for idx, item in enumerate(self.alumnos_items):
             nombre_al = formatear_nombre_propio(item.var_nombre.get())
             actividad_al = item.var_actividad.get()
             detalle_act_al = item.var_actividad_otro.get().strip() if actividad_al == "Otro" else ""
@@ -1580,7 +1531,6 @@ class ReemplazoCuadernoApp:
         titular._toggle_carnet(enfocar=False)
         titular.activar_carnet(True)  # el carnet va tildado por defecto
         titular._carnet_off_por_cda = False
-        titular._gf_por_jubilado = False
         mp = self.var_metodo_pago.get()
         titular.var_descuento.set("Efectivo" if mp == "Efectivo" else "Ninguno")
         titular.var_fecha_vencimiento.set(self.var_fecha_vencimiento.get())
